@@ -265,8 +265,11 @@ class H3ModelPatcher(ModelPatcherDynamic):
         return int(self.handle.gguf.stream_working_set_bytes)
 
     def loaded_size(self):
-        # Live CUDA weight tile bytes; this changes during each projection.
-        return int(self.handle.gguf.memory_stats.snapshot()["active_vram_bytes"])
+        # Include ComfyUI's VBAR accounting plus H3's transient CUDA weight tile.
+        return int(
+            super().loaded_size()
+            + self.handle.gguf.memory_stats.snapshot()["active_vram_bytes"]
+        )
 
     def loaded_ram_size(self):
         # Live raw + decoded host staging buffers. The mmap is disk-backed and
