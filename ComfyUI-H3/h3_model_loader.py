@@ -245,13 +245,23 @@ class H3ModelPatcher(ModelPatcher):
     def handle(self):
         return self.model.handle
 
+    def is_dynamic(self):
+        # H3 streams weights on demand from the checkpoint mmap.
+        return True
+
     def model_size(self):
-        # No persistent torch parameters are resident on the GPU.
-        return 0
+        # ComfyUI manages the maximum simultaneously resident FP32 weight tile,
+        # not the complete disk-backed GGUF checkpoint.
+        return int(self.handle.gguf.stream_working_set_bytes)
 
     def loaded_size(self):
-        # Active row tiles are transient allocations, not resident weights.
-        return 0
+        # Live CUDA weight tile bytes; this changes during each projection.
+        return int(self.handle.gguf.memory_stats.snapshot()["active_vram_bytes"])
+
+    def loaded_ram_size(self):
+        # Live raw + decoded host staging buffers. The mmap is disk-backed and
+        # is reported separately rather than being mislabelled as resident RAM.
+        return int(self.handle.gguf.memory_stats.snapshot()["active_host_bytes"])
 
     def model_dtype(self):
         return torch.float32
@@ -356,8 +366,9 @@ class H3ModelLoader:
         )
         print(
             f"[H3 Model Loader] Registered streamed MODEL with ComfyUI "
-            f"(GGUF mapping: {handle.file_size / (1024 ** 3):.2f} GiB; "
-            f"persistent GPU parameters: 0).",
+            f"(GGUF mmap: {handle.file_size / (1024 ** 3):.2f} GiB; "
+            f"maximum managed FP32 weight tile: "
+            f"{runtime.handle.gguf.stream_working_set_bytes / (1024 ** 2):.2f} MiB).",
             flush=True,
         )
         return (patcher,)
