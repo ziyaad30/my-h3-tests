@@ -231,7 +231,13 @@ def load_full_checkpoint(model, checkpoint_path):
     state = model.state_dict()
     params = dict(model.named_parameters())
     required = set(params)
-    required.update(("latents_mean", "latents_std"))
+    required.update((
+        "latents_mean",
+        "latents_std",
+        # ComfyUI uses this checkpoint tensor to identify the H3 audio VAE.
+        # The reference module registers it as a buffer, so require it explicitly.
+        "pre_block.attn.zero_k_bias",
+    ))
 
     with safe_open(str(checkpoint_path), framework="pt", device="cpu") as handle:
         keys = set(handle.keys())
@@ -268,15 +274,6 @@ def load_full_checkpoint(model, checkpoint_path):
                 target.copy_(source.to(device=target.device, dtype=target.dtype))
                 loaded += 1
 
-            # If the checkpoint stores the explicit zero key-bias buffer,
-            # load it; otherwise retain the mathematically zero initialization.
-            zero_bias_name = "pre_block.attn.zero_k_bias"
-            if prefix + zero_bias_name in keys:
-                source = handle.get_tensor(prefix + zero_bias_name)
-                target = state[zero_bias_name]
-                if tuple(source.shape) != tuple(target.shape):
-                    raise RuntimeError("zero_k_bias checkpoint shape mismatch")
-                target.copy_(source.to(target))
 
     if not torch.isfinite(model.latents_mean).all():
         raise RuntimeError("latents_mean contains NaN/Inf")
