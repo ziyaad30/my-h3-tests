@@ -115,6 +115,73 @@ def report_cuda_memory(label: str) -> None:
     print(f"CUDA peak alloc:{torch.cuda.max_memory_allocated() / mib:.2f} MiB")
     print(f"CUDA peak reserv:{torch.cuda.max_memory_reserved() / mib:.2f} MiB")
 
+def report_system_memory(label: str) -> None:
+    """Report Windows physical RAM and this process's resident working set."""
+    print(f"\n========== SYSTEM RAM: {label} ==========", flush=True)
+    if __import__("os").name != "nt":
+        print("Windows RAM counters unavailable on this platform.", flush=True)
+        return
+
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("cb", ctypes.c_ulong),
+            ("PageFaultCount", ctypes.c_ulong),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    mib = 1024.0 ** 2
+    status = MEMORYSTATUSEX()
+    status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+        print("GlobalMemoryStatusEx failed.", flush=True)
+        return
+
+    print(
+        f"Physical RAM: {status.ullAvailPhys / mib:.0f} MiB available / "
+        f"{status.ullTotalPhys / mib:.0f} MiB total "
+        f"({status.dwMemoryLoad}% in use)",
+        flush=True,
+    )
+    counters = PROCESS_MEMORY_COUNTERS()
+    counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+    process = ctypes.windll.kernel32.GetCurrentProcess()
+    ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+        process, ctypes.byref(counters), counters.cb
+    )
+    if ok:
+        print(
+            f"Process working set: {counters.WorkingSetSize / mib:.0f} MiB "
+            f"(peak {counters.PeakWorkingSetSize / mib:.0f} MiB)",
+            flush=True,
+        )
+        print(
+            f"Process pagefile usage: {counters.PagefileUsage / mib:.0f} MiB "
+            f"(peak {counters.PeakPagefileUsage / mib:.0f} MiB)",
+            flush=True,
+        )
+    else:
+        print("GetProcessMemoryInfo failed.", flush=True)
+
 
 # ---------------------------------------------------------------------------
 # Qwen3-VL -> MiniMax H3 ClipProj conditioning
@@ -1063,6 +1130,7 @@ def main():
     args = parse_args()
 
     require(torch.cuda.is_available(), "CUDA is unavailable")
+    report_system_memory("startup")
     if args.decode_only is not None:
         require(args.decode_only.is_file(), f"Latent package not found: {args.decode_only}")
         require(args.decoder_checkpoint.is_file(), f"LightVAE decoder checkpoint not found: {args.decoder_checkpoint}")
@@ -1131,6 +1199,7 @@ def main():
     print("Prompt:", args.prompt)
 
     # Run Qwen first, then close it before loading VAE/transformer work.
+    report_system_memory("before Qwen conditioning")
     text_states = extract_qwen_conditioning(
         args.prompt,
         args.qwen_model,
@@ -1138,14 +1207,17 @@ def main():
     )
     gc.collect()
     torch.cuda.empty_cache()
+    report_system_memory("after Qwen conditioning and cleanup")
 
     keyframes = encode_keyframes(args)
     gc.collect()
     torch.cuda.empty_cache()
+    report_system_memory("after keyframe encoding and cleanup")
 
     torch.cuda.reset_peak_memory_stats()
 
     start = time.perf_counter()
+    report_system_memory("before GGUF load and denoising")
     with GGUF(str(args.gguf)) as gguf:
         validate_checkpoint(gguf)
 
@@ -1196,8 +1268,11 @@ def main():
         )
 
         del engine
+        gc.collect()
+        torch.cuda.empty_cache()
 
     total_elapsed = time.perf_counter() - start
+    report_system_memory("after GGUF close and transformer cleanup")
 
     print("\n========== H3 FL2VA COMPLETE ==========")
     print("Saved latent package:", output_path.resolve())
@@ -1206,6 +1281,7 @@ def main():
     print(f"Sampling elapsed: {sampling_elapsed:.2f}s")
     print(f"Total elapsed: {total_elapsed:.2f}s")
     report_cuda_memory("CUDA memory summary")
+    report_system_memory("before video decoding")
     if not args.no_decode:
         decoded = decode_video_latents(
             video_latent.detach().cpu(),
@@ -1216,6 +1292,7 @@ def main():
         print("Decoded PNG frames:", decoded["frames_dir"].resolve())
         if decoded["mp4_path"] is not None:
             print("Decoded MP4:", decoded["mp4_path"].resolve())
+        report_system_memory("after video decoding")
     else:
         print("Video decoding skipped by --no-decode.")
     print("Audio latent was generated jointly but was not waveform-decoded.")
