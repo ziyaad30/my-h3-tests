@@ -895,12 +895,14 @@ class TiledGGUFLinear:
                     weight.T,
                 )
             finally:
+                # Drop the CPU tensor view before ComfyUI truncates its
+                # HostBuffer backing allocation.
+                if weight is not None:
+                    del weight
                 if host_tile_lease is not None:
                     patcher.release_host_tile(host_tile_lease)
                 if vram_weight_bytes:
                     self.gguf.memory_stats.remove_vram(vram_weight_bytes)
-                if weight is not None:
-                    del weight
                 if host_weight_bytes:
                     self.gguf.memory_stats.remove_host(host_weight_bytes)
                 if weight_np is not None:
