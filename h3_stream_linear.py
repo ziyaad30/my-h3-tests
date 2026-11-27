@@ -64,7 +64,7 @@ Q2K_BLOCK_BYTES = 84
 # Measured on the GTX 1650:
 # 2048 was fastest in both streamed linear and transformer
 # block tests. Eight-block propagation also remained stable.
-CUDA_MIN_ROW_TILE = 2048
+CUDA_MIN_ROW_TILE = 128
 
 # Four threads was the fastest measured setting on the
 # user's 8-logical-processor CPU.
