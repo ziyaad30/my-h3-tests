@@ -454,11 +454,10 @@ class H3InferenceEngine:
         self.transformer_blocks = transformer_blocks
         self.seed = int(seed)
         self.lora = lora
-        if self.lora is not None:
-            for block in self.transformer_blocks:
-                block.lora = self.lora.load_block(
-                    "blocks", block.block_index, block.device
-                )
+        # Do not preload all 50 adapters: only the active block's factors are
+        # moved to the execution device, then released before the next block.
+        for block in self.transformer_blocks:
+            block.lora = None
         self.row_tile = CUDA_ROW_TILE
 
         self.layout = build_packed_layout(
@@ -713,15 +712,25 @@ class H3InferenceEngine:
 
             block = self.transformer_blocks[block_index]
 
+            # Load only this block's LoRA factors. Keeping all 50 adapters
+            # resident would defeat the memory-bounded streamed execution.
+            if self.lora is not None:
+                block.lora = self.lora.load_block(
+                    "blocks", block.block_index, block.device
+                )
+
             # hidden stays in CPU RAM between blocks. The block moves its
             # active working tensors to CUDA and returns the result to CPU.
-            hidden = block(
-                hidden,
-                modulation_table,
-                adaln_indices,
-                self.position_ids,
-                self.inv_freq,
-            )
+            try:
+                hidden = block(
+                    hidden,
+                    modulation_table,
+                    adaln_indices,
+                    self.position_ids,
+                    self.inv_freq,
+                )
+            finally:
+                block.lora = None
 
             del modulation_table, adaln_indices
             torch.cuda.synchronize()
