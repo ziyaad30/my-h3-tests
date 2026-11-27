@@ -10,7 +10,7 @@ import threading
 
 import torch
 import folder_paths
-from comfy.model_patcher import ModelPatcherDynamic
+from comfy.model_patcher import ModelPatcher
 
 # ---------------------------------------------------------------------------
 # Streamed H3 transformer checkpoint loader
@@ -220,129 +220,6 @@ class H3TransformerRuntime(torch.nn.Module):
         )
 
 
-class H3ModelPatcher(ModelPatcherDynamic):
-    """ComfyUI-managed lifecycle wrapper for the streamed H3 runtime."""
-
-    def __init__(
-        self,
-        model,
-        load_device,
-        offload_device,
-        size=0,
-        weight_inplace_update=False,
-        fast_disk=False,
-    ):
-        super().__init__(
-            model,
-            load_device,
-            offload_device,
-            size=0,
-            weight_inplace_update=weight_inplace_update,
-            fast_disk=fast_disk,
-        )
-
-    @property
-    def handle(self):
-        return self.model.handle
-
-    # ModelPatcherDynamic supplies ComfyUI's dynamic-model lifecycle,
-    # including prompt tracking and dynamic VRAM/RAM eviction hooks. H3
-    # overrides the weight-loading hooks because its GGUF tiles are streamed
-    # by TiledGGUFLinear rather than represented as torch Parameters.
-    def model_size(self):
-        # ComfyUI manages the maximum simultaneously resident FP32 weight tile,
-        # not the complete disk-backed GGUF checkpoint.
-        return int(self.handle.gguf.stream_working_set_bytes)
-
-    def loaded_size(self):
-        # Include ComfyUI's VBAR accounting plus H3's transient CUDA weight tile.
-        return int(
-            super().loaded_size()
-            + self.handle.gguf.memory_stats.snapshot()["active_vram_bytes"]
-        )
-
-    def loaded_ram_size(self):
-        # Live raw + decoded host staging buffers. The mmap is disk-backed and
-        # is reported separately rather than being mislabelled as resident RAM.
-        return int(self.handle.gguf.memory_stats.snapshot()["active_host_bytes"])
-
-    def model_dtype(self):
-        return torch.float32
-
-    def model_patches_to(self, device):
-        # H3 GGUF tensors are not ordinary ModelPatcher weight patches.
-        return None
-
-    def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
-        # Use ComfyUI's actual dynamic loader. Besides registering the patcher
-        # with the dynamic manager, this initializes its VBAR and managed
-        # HostBuffer pools. The runtime has no torch Parameters, so its dynamic
-        # module scan stages no model weights; H3 supplies tiles on demand.
-        with self.handle.execution_lock:
-            if self.handle.closed or self.handle.gguf is None:
-                raise RuntimeError("Cannot activate a closed H3 checkpoint.")
-            super().partially_load(
-                device_to,
-                extra_memory=extra_memory,
-                force_patch_weights=force_patch_weights,
-            )
-            self.model.dynamic_pins[self.load_device]["active"] = True
-        return 0
-
-    def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
-        # Delegate VBAR/back-up eviction to ComfyUI's dynamic patcher.
-        with self.handle.execution_lock:
-            return super().partially_unload(
-                device_to,
-                memory_to_free=memory_to_free,
-                force_patch_weights=force_patch_weights,
-            )
-
-    def unpatch_model(self, device_to=None, unpatch_weights=True):
-        # ModelPatcherDynamic's implementation avoids model.to() on the
-        # runtime, unloads VBAR pages and evicts managed HostBuffer tiles.
-        with self.handle.execution_lock:
-            super().unpatch_model(
-                device_to=None, unpatch_weights=unpatch_weights
-            )
-            if unpatch_weights:
-                self.model.dynamic_pins[self.load_device]["active"] = False
-            if device_to is not None:
-                self.model.device = torch.device(device_to)
-        return self.model
-
-    def patch_model(
-        self,
-        device_to=None,
-        lowvram_model_memory=0,
-        load_weights=True,
-        force_patch_weights=False,
-    ):
-        # Delegate the no-weight patch operation to ComfyUI's dynamic
-        # patcher. The streamed GGUF is never passed through model.to().
-        if load_weights:
-            raise RuntimeError(
-                "H3 weights are streamed; load through load_models_gpu(), "
-                "not ModelPatcher.patch_model()."
-            )
-        return super().patch_model(
-            device_to=device_to,
-            lowvram_model_memory=lowvram_model_memory,
-            load_weights=False,
-            force_patch_weights=force_patch_weights,
-        )
-
-    def detach(self, unpatch_all=True):
-        # Preserve the mmap for graph reuse when ComfyUI evicts this patcher.
-        with self.handle.execution_lock:
-            result = super().detach(unpatch_all=unpatch_all)
-            # detach(unpatch_all=False) skips unpatch_model; still mark the
-            # dynamic model inactive and move its logical device to offload.
-            self.model.dynamic_pins[self.load_device]["active"] = False
-            self.model.device = self.offload_device
-            return result
-
-
 # Register a dedicated dropdown without changing ComfyUI's normal GGUF lists.
 folder_paths.folder_names_and_paths["h3_transformer_gguf"] = (
     folder_paths.get_folder_paths("diffusion_models"),
@@ -389,12 +266,12 @@ class H3ModelLoader:
         import comfy.model_management
 
         runtime = H3TransformerRuntime(handle)
-        patcher = H3ModelPatcher(
+        patcher = ModelPatcher(
             runtime,
             load_device=comfy.model_management.get_torch_device(),
             offload_device=comfy.model_management.unet_offload_device(),
+            size=handle.gguf.stream_working_set_bytes,
         )
-        handle.gguf.comfy_model_patcher = patcher
         print(
             f"[H3 Model Loader] Registered streamed MODEL with ComfyUI "
             f"(GGUF mmap: {handle.file_size / (1024 ** 3):.2f} GiB; "
