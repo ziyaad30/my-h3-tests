@@ -46,6 +46,7 @@ from h3_transformer_ops import (
     rms_norm,
 )
 from h3_scheduler import H3FlowScheduler
+from minimax_h3_lightvae_decoder import decode_video_latents
 
 
 # ---------------------------------------------------------------------------
@@ -1051,6 +1052,9 @@ def parse_args():
     parser.add_argument("--steps", type=int, default=7)
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--output-dir", type=Path, default=Path("h3_output"))
+    parser.add_argument("--decoder-checkpoint", type=Path, default=Path("C:/Users/User/PycharmProjects/pythonProject/models/vae/lightvae-lite-h3-decoder.safetensors"))
+    parser.add_argument("--fps", type=float, default=24.0)
+    parser.add_argument("--no-decode", action="store_true", help="Save latents only; skip video decoding")
     return parser.parse_args()
 
 
@@ -1074,6 +1078,9 @@ def main():
         "H3 frame count must be 5 + 17*n",
     )
     require(args.steps >= 1, "At least one denoising evaluation is required")
+    require(args.fps > 0, "FPS must be positive")
+    if not args.no_decode:
+        require(args.decoder_checkpoint.is_file(), f"LightVAE decoder checkpoint not found: {args.decoder_checkpoint}")
 
     if args.first_image is not None:
         require(args.first_image.is_file(), f"First image not found: {args.first_image}")
@@ -1180,7 +1187,18 @@ def main():
     print(f"Sampling elapsed: {sampling_elapsed:.2f}s")
     print(f"Total elapsed: {total_elapsed:.2f}s")
     report_cuda_memory("CUDA memory summary")
-    print("Video latent is ready for the existing LightVAE-Lite decoder.")
+    if not args.no_decode:
+        decoded = decode_video_latents(
+            video_latent.detach().cpu(),
+            output_dir=args.output_dir / "decoded_video",
+            checkpoint=args.decoder_checkpoint,
+            fps=args.fps,
+        )
+        print("Decoded PNG frames:", decoded["frames_dir"].resolve())
+        if decoded["mp4_path"] is not None:
+            print("Decoded MP4:", decoded["mp4_path"].resolve())
+    else:
+        print("Video decoding skipped by --no-decode.")
     print("Audio latent was generated jointly but was not waveform-decoded.")
 
 
