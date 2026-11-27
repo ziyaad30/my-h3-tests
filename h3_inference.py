@@ -1038,7 +1038,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Standalone streamed MiniMax H3 FL2VA inference"
     )
-    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--prompt", default=None)
     parser.add_argument("--gguf", type=Path, default=Path(DEFAULT_GGUF))
     parser.add_argument("--qwen-model", type=Path, default=QWEN_MODEL_DEFAULT)
     parser.add_argument(
@@ -1055,6 +1055,7 @@ def parse_args():
     parser.add_argument("--decoder-checkpoint", type=Path, default=Path("C:/Users/User/PycharmProjects/pythonProject/models/vae/lightvae-lite-h3-decoder.safetensors"))
     parser.add_argument("--fps", type=float, default=24.0)
     parser.add_argument("--no-decode", action="store_true", help="Save latents only; skip video decoding")
+    parser.add_argument("--decode-only", type=Path, default=None, help="Decode video_latent from an existing .pt latent package without running the transformer")
     return parser.parse_args()
 
 
@@ -1062,6 +1063,24 @@ def main():
     args = parse_args()
 
     require(torch.cuda.is_available(), "CUDA is unavailable")
+    if args.decode_only is not None:
+        require(args.decode_only.is_file(), f"Latent package not found: {args.decode_only}")
+        require(args.decoder_checkpoint.is_file(), f"LightVAE decoder checkpoint not found: {args.decoder_checkpoint}")
+        package = torch.load(args.decode_only, map_location="cpu", weights_only=False)
+        require(isinstance(package, dict) and "video_latent" in package,
+                "Latent package does not contain video_latent")
+        latent = package["video_latent"]
+        decoded = decode_video_latents(
+            latent,
+            output_dir=args.output_dir / "decoded_video",
+            checkpoint=args.decoder_checkpoint,
+            fps=args.fps,
+        )
+        print("Decoded PNG frames:", decoded["frames_dir"].resolve())
+        if decoded["mp4_path"] is not None:
+            print("Decoded MP4:", decoded["mp4_path"].resolve())
+        return
+    require(bool(args.prompt and args.prompt.strip()), "--prompt is required unless --decode-only is used")
     require(args.gguf.is_file(), f"H3 GGUF not found: {args.gguf}")
     require(args.qwen_model.is_file(), f"Qwen model not found: {args.qwen_model}")
     require(
