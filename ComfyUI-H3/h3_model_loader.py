@@ -18,30 +18,69 @@ import folder_paths
 # implementation. It memory-maps the checkpoint; it does not materialize
 # the transformer weights in RAM or VRAM.
 def _load_h3_gguf_reader():
+    """Find the standalone H3 modules in supported ComfyUI checkout layouts."""
     import sys
 
-    here = os.path.dirname(os.path.abspath(__file__))
     candidates = []
+
+    def add(path):
+        if not path:
+            return
+        path = os.path.abspath(os.fspath(path))
+        if path not in candidates:
+            candidates.append(path)
+
+    # Explicit override is useful for non-standard ComfyUI installations.
+    add(os.environ.get("H3_PROJECT_ROOT"))
+
+    # The package may be installed either as:
+    #   custom_nodes/ComfyUI-H3/                 (package files at repo root)
+    # or:
+    #   custom_nodes/ComfyUI-H3/ComfyUI-H3/      (repo contains a package subdir)
+    here = os.path.dirname(os.path.abspath(__file__))
+    add(here)
     parent = here
-    for _ in range(4):
-        candidates.append(parent)
+    for _ in range(6):
         parent = os.path.dirname(parent)
+        add(parent)
+
+    # ComfyUI's own path registry is authoritative for custom-node locations.
+    add(os.path.dirname(os.path.abspath(folder_paths.__file__)))
+    add(getattr(folder_paths, "base_path", None))
+    try:
+        for custom_nodes_dir in folder_paths.get_folder_paths("custom_nodes"):
+            add(custom_nodes_dir)
+            # Also handle a repository checked out as a child of custom_nodes.
+            try:
+                for child in os.scandir(custom_nodes_dir):
+                    if child.is_dir():
+                        add(child.path)
+            except OSError:
+                pass
+    except Exception:
+        pass
 
     for candidate in candidates:
-        if os.path.isfile(os.path.join(candidate, "h3_stream_linear.py")):
+        module_path = os.path.join(candidate, "h3_stream_linear.py")
+        if os.path.isfile(module_path):
             if candidate not in sys.path:
                 sys.path.insert(0, candidate)
-            break
-    else:
-        raise ImportError(
-            "Could not locate the project's h3_stream_linear.py. "
-            "Keep the current h3_ implementation modules in the project "
-            "root alongside the ComfyUI-H3 folder."
-        )
+            try:
+                from h3_stream_linear import GGUF
+            except Exception as exc:
+                raise ImportError(
+                    f"Found {module_path}, but importing GGUF from it failed: {exc}"
+                ) from exc
+            return GGUF
 
-    from h3_stream_linear import GGUF
-    return GGUF
-
+    searched = "\\n".join(f"  - {path}" for path in candidates)
+    raise ImportError(
+        "Could not locate the project's h3_stream_linear.py. Searched these "
+        "ComfyUI/package locations:\\n"
+        f"{searched}\\n"
+        "Keep the standalone h3_*.py modules in the H3 repository root, or "
+        "set H3_PROJECT_ROOT to the directory containing h3_stream_linear.py."
+    )
 
 def _validate_h3_checkpoint(gguf):
     required = [
