@@ -287,6 +287,29 @@ def apply_rope(x, cos, sin):
 # SWIGLU
 # ============================================================
 
+def reorder_interleaved_qkv(qkv: torch.Tensor) -> torch.Tensor:
+    """
+    Convert MiniMax checkpoint QKV rows from per-head interleaved order
+    [Q0,K0,V0,Q1,K1,V1,...] to split [all Q, all K, all V] order.
+
+    This is the same row permutation used by WeeLLM when it maps the
+    original MiniMax fused qkv_proj weights into Diffusers projections.
+    Applying it to the projected activations is equivalent and keeps
+    the GGUF matrix streamed rather than materializing/reordering weights.
+    """
+    if qkv.ndim != 2 or qkv.shape[1] != 3 * INNER_SIZE:
+        raise ValueError(
+            f"Expected fused QKV [tokens,{3 * INNER_SIZE}], got {tuple(qkv.shape)}"
+        )
+    tokens = qkv.shape[0]
+    return (
+        qkv.reshape(tokens, NUM_HEADS, 3, HEAD_DIM)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .reshape(tokens, 3 * INNER_SIZE)
+    )
+
+
 def swiglu(x):
     if x.shape[-1] % 2:
         raise ValueError(
@@ -691,6 +714,9 @@ class H3TransformerBlock:
             raise RuntimeError(
                 f"Unexpected QKV shape: {tuple(qkv.shape)}"
             )
+        # The GGUF checkpoint stores Q/K/V interleaved within each head.
+        # Reorder to split Q-all, K-all, V-all before LoRA and attention.
+        qkv = reorder_interleaved_qkv(qkv)
         if self.lora is not None:
             self.lora.add_qkv(normalized, qkv)
 
@@ -950,6 +976,35 @@ def test_rope(device):
     check_finite("Three-axis partial RoPE", output)
 
 
+def test_qkv_reorder(device):
+    # Verify that reordering projected activations is exactly equivalent
+    # to applying WeeLLM's row permutation to the checkpoint weight first.
+    torch.manual_seed(1234)
+    tokens, input_width = 3, 11
+    weight = torch.randn(3 * INNER_SIZE, input_width, device=device)
+    x = torch.randn(tokens, input_width, device=device)
+
+    grouped = weight.reshape(NUM_HEADS, 3 * HEAD_DIM, input_width)
+    query, key, value = grouped.split(HEAD_DIM, dim=1)
+    reordered_weight = torch.cat(
+        [
+            part.reshape(INNER_SIZE, input_width)
+            for part in (query, key, value)
+        ],
+        dim=0,
+    )
+
+    raw_output = x @ weight.T
+    expected = x @ reordered_weight.T
+    actual = reorder_interleaved_qkv(raw_output)
+
+    if not torch.allclose(actual, expected, atol=1e-5, rtol=1e-5):
+        error = (actual - expected).abs().max().item()
+        raise AssertionError(f"QKV reorder mismatch: max error={error}")
+
+    print(f"{device}: interleaved QKV reorder PASSED")
+
+
 def test_swiglu(device):
     x = torch.randn(
         4,
@@ -1011,6 +1066,7 @@ def run_operator_tests():
         tests = [
             ("RMSNorm", test_rms_norm),
             ("three-axis partial RoPE", test_rope),
+            ("interleaved QKV reorder", test_qkv_reorder),
             ("SwiGLU", test_swiglu),
             ("streamed full attention", test_attention),
         ]
@@ -1711,6 +1767,8 @@ class H3TokenRefiner:
         normalized = rms_norm(hidden, self.norm1)
 
         qkv = self.qkv(normalized)
+        # Token-refiner QKV uses the same per-head interleaved checkpoint layout.
+        qkv = reorder_interleaved_qkv(qkv)
         if self.lora is not None:
             self.lora.add_qkv(normalized, qkv)
         qkv = qkv.reshape(hidden.shape[0], 3, 56, 128)
