@@ -16,6 +16,9 @@ import numpy as np
 import torch
 from safetensors.torch import load_file
 
+from llama_cpp import Llama
+import llama_cpp.llama_cpp as binding
+
 import folder_paths
 
 
@@ -124,10 +127,7 @@ def _encode(prompt, qwen_path, projection_path, unload_after_encode):
         raise FileNotFoundError(f"Qwen GGUF not found: {qwen_path}")
     if not os.path.isfile(projection_path):
         raise FileNotFoundError(f"ClipProj not found: {projection_path}")
-    from llama_cpp import Llama
-    from llama_cpp import llama_cpp as llama_binding
-
-    if not hasattr(llama_binding, "llama_get_layer_output"):
+    if not hasattr(binding, "llama_get_layer_output"):
         raise RuntimeError(
             "This node requires the project's modified llama_cpp build "
             "with llama_get_layer_output."
@@ -140,7 +140,7 @@ def _encode(prompt, qwen_path, projection_path, unload_after_encode):
     try:
         # Match the standalone production path: do not reset a newly-created
         # llama.cpp context before its first evaluation.
-        tokens = llm.tokenize(prompt.encode("utf-8"), add_bos=True)
+        tokens = llm.tokenize(prompt.strip().encode("utf-8"), add_bos=True)
         if not tokens or len(tokens) > 512:
             raise ValueError(
                 f"Prompt must tokenize to 1–512 tokens; got {len(tokens)}."
@@ -150,7 +150,7 @@ def _encode(prompt, qwen_path, projection_path, unload_after_encode):
 
         token_count = ctypes.c_int32(0)
         embedding_width = ctypes.c_int32(0)
-        pointer = llama_binding.llama_get_layer_output(
+        pointer = binding.llama_get_layer_output(
             llm._ctx.ctx,
             ctypes.byref(token_count),
             ctypes.byref(embedding_width),
@@ -172,10 +172,8 @@ def _encode(prompt, qwen_path, projection_path, unload_after_encode):
             pointer,
             ctypes.POINTER(ctypes.c_float * count),
         ).contents
-        hidden = torch.from_numpy(
-            np.fromiter(raw, dtype=np.float32, count=count)
-            .reshape(token_count.value, embedding_width.value)
-            .copy()
+        hidden = torch.tensor(list(raw), dtype=torch.float32).reshape(
+            token_count.value, embedding_width.value
         )
 
         # In persistent mode, clear the evaluated sequence only after the
