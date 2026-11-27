@@ -277,6 +277,8 @@ def build_packed_layout(
     keyframes: list[dict],
     fps: float = DEFAULT_FPS,
 ) -> dict:
+    if not math.isfinite(float(fps)) or fps <= 0:
+        raise ValueError(f"fps must be a positive finite number, got {fps}")
     frame_coordinates, width_axis = frame_grid(latent_h, latent_w)
     frame_rows = frame_coordinates.shape[0]
     origin = float(text_length)
@@ -308,6 +310,7 @@ def build_packed_layout(
                 latent.shape[2],
                 frame_coordinates,
                 origin + FRAME_RESCALE * frame_index * (DEFAULT_FPS / float(fps)),
+                fps,
             )
         )
         row = end
