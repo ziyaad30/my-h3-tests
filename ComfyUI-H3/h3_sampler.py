@@ -3,12 +3,7 @@ import gc
 
 import torch
 
-from .h3_engine import (
-    NUM_BLOCKS,
-    H3InferenceEngine,
-    sample as run_h3_sampling,
-    validate_checkpoint,
-)
+from .h3_engine import NUM_BLOCKS
 
 
 def _check_interrupted():
@@ -48,8 +43,15 @@ class H3Sampler:
             raise TypeError("H3 Sampler expects the MODEL output from H3 Model Loader.")
         runtime = getattr(model, "model", None)
         handle = getattr(runtime, "handle", None)
-        if handle is None or handle.closed or handle.gguf is None:
-            raise RuntimeError("H3 ModelPatcher is closed or has no mapped GGUF checkpoint.")
+        if (
+            handle is None
+            or handle.closed
+            or handle.gguf is None
+            or not callable(getattr(runtime, "sample", None))
+        ):
+            raise RuntimeError(
+                "H3 ModelPatcher does not contain an active H3 transformer runtime."
+            )
         if width <= 0 or height <= 0 or width % 32 or height % 32:
             raise ValueError("H3 width and height must be positive multiples of 32.")
         if frames < 5 or (frames - 5) % 17:
@@ -94,48 +96,36 @@ class H3Sampler:
             progress.update_absolute(completed, total)
             _check_interrupted()
 
-        engine = None
-        handle.execution_lock.acquire()
         try:
             _check_interrupted()
 
-            # Register with ComfyUI's model manager before allocating inference
-            # tensors. H3 has no persistent GPU weights; row tiles stream per block.
+            # Register the actual H3 transformer runtime with ComfyUI's model
+            # manager. The patcher owns this runtime; its sample() method below
+            # performs the complete joint audio/video transformer execution.
             import comfy.model_management
             comfy.model_management.load_models_gpu([model], memory_required=0)
 
-            gguf = handle.gguf
-            validate_checkpoint(gguf)
             print(
                 f"[H3 Sampler] {width}x{height}, {frames} frames, "
                 f"{steps} evaluations, seed={seed}",
                 flush=True,
             )
-            engine = H3InferenceEngine(
-                gguf=gguf,
+            del handle
+            video_latent, audio_latent, elapsed, _, _ = runtime.sample(
                 text_states=text_states,
                 keyframes=[],
                 latent_t=latent_t,
                 latent_h=latent_h,
                 latent_w=latent_w,
                 audio_t=audio_t,
+                steps=steps,
                 seed=seed,
                 lora=None,
+                progress_callback=update_progress,
             )
             del text_states
             gc.collect()
             _check_interrupted()
-
-            video_latent, audio_latent, elapsed, _, _ = run_h3_sampling(
-                engine=engine,
-                latent_t=latent_t,
-                latent_h=latent_h,
-                latent_w=latent_w,
-                audio_t=audio_t,
-                steps=steps,
-                seed=seed,
-                progress_callback=update_progress,
-            )
             print(
                 f"[H3 Sampler] Joint audio/video sampling completed in {elapsed:.2f}s.",
                 flush=True,
@@ -156,12 +146,6 @@ class H3Sampler:
                 },
             )
         finally:
-            # This also runs when ComfyUI raises its native interruption
-            # exception, ensuring the active block/engine references are freed.
-            try:
-                if engine is not None:
-                    del engine
-                gc.collect()
-                torch.cuda.empty_cache()
-            finally:
-                handle.execution_lock.release()
+            # The managed transformer owns engine cleanup and its execution lock.
+            gc.collect()
+            torch.cuda.empty_cache()
