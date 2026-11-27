@@ -654,6 +654,59 @@ def decode_q2k(raw):
 
 
 # ============================================================
+# CUDA Q2_K DECODER
+# ============================================================
+
+@torch.inference_mode()
+def _decode_q2k_torch(raw, row_count, input_width, device):
+    """
+    Transfer the compact Q2_K bytes to the target device and decode there.
+
+    The CUDA transformer path must not dequantize every streamed weight tile
+    on the CPU. Only the compressed mmap slice is copied from host memory;
+    the expanded FP32 tile is produced on the target device.
+    """
+    if input_width % Q2K_BLOCK_ELEMENTS:
+        raise ValueError(f"Q2_K input width is not block-aligned: {input_width}")
+
+    block_count = row_count * (input_width // Q2K_BLOCK_ELEMENTS)
+    raw_array = np.frombuffer(raw, dtype=np.uint8)
+    expected_bytes = block_count * Q2K_BLOCK_BYTES
+    if raw_array.size != expected_bytes:
+        raise ValueError(
+            f"Q2_K tile byte count mismatch: {raw_array.size} != {expected_bytes}"
+        )
+
+    # Copy only compressed bytes out of the read-only mmap before transfer.
+    packed = torch.from_numpy(raw_array.copy()).to(device=device)
+    blocks = packed.view(block_count, Q2K_BLOCK_BYTES)
+
+    scales = blocks[:, :16].to(torch.int32).view(block_count, 2, 4, 2)
+    quant = blocks[:, 16:80].to(torch.int32).view(block_count, 2, 2, 16)
+
+    # Each Q2_K block ends with two FP16 values: d and dmin.
+    factors = blocks[:, 80:84].contiguous().view(torch.float16).to(torch.float32)
+    d = factors[:, 0].view(block_count, 1, 1, 1)
+    dmin = factors[:, 1].view(block_count, 1, 1, 1)
+
+    shifts = torch.tensor((0, 2, 4, 6), dtype=torch.int32, device=device)
+    quant_values = (
+        (quant.unsqueeze(2) >> shifts.view(1, 1, 4, 1, 1)) & 3
+    ).to(torch.float32)
+
+    scale_low = (scales & 15).to(torch.float32)
+    scale_high = (scales >> 4).to(torch.float32)
+    multipliers = d * scale_low
+    minima = dmin * scale_high
+
+    decoded = (
+        multipliers.unsqueeze(-1) * quant_values
+        - minima.unsqueeze(-1)
+    )
+    return decoded.reshape(row_count, input_width)
+
+
+# ============================================================
 # OTHER GGML WEIGHT DECODERS
 # ============================================================
 
@@ -841,35 +894,45 @@ class TiledGGUFLinear:
                 # raw is a memoryview into the mmap, not a copied host buffer.
                 raw_bytes = 0
 
-                weight_np = decode_weight_tile(
-                    raw,
-                    self.ggml_type,
-                    rows,
-                    self.input_width,
-                )
-                host_weight_bytes = int(weight_np.nbytes)
-                self.gguf.memory_stats.add_host(host_weight_bytes)
-
-                if not np.isfinite(weight_np).all():
-                    raise FloatingPointError(
-                        f"Non-finite weight values in {self.name}"
+                if self.ggml_type == TYPE_Q2_K and self.device.type == "cuda":
+                    # Decode the dominant quantized transformer weights on CUDA.
+                    # CPU projections retain the measured Numba decoder path.
+                    weight = _decode_q2k_torch(
+                        raw,
+                        rows,
+                        self.input_width,
+                        self.device,
                     )
-
-                # Keep the streamed tile in its decoded CPU buffer for CPU
-                # projections. For CUDA projections, transfer only this tile.
-                # Do not pin each tile: ComfyUI's dynamic ModelPatcher manages
-                # model residency, while these short-lived buffers are bounded
-                # scratch space and are accounted by StreamMemoryStats.
-                weight = torch.from_numpy(
-                    np.ascontiguousarray(weight_np)
-                ).to(
-                    device=self.device,
-                    dtype=torch.float32,
-                )
-
-                if weight.device.type == "cuda":
                     vram_weight_bytes = weight.numel() * weight.element_size()
                     self.gguf.memory_stats.add_vram(vram_weight_bytes)
+
+                    if not torch.isfinite(weight).all().item():
+                        raise FloatingPointError(
+                            f"Non-finite decoded CUDA weight tile in {self.name}"
+                        )
+                else:
+                    weight_np = decode_weight_tile(
+                        raw,
+                        self.ggml_type,
+                        rows,
+                        self.input_width,
+                    )
+                    host_weight_bytes = int(weight_np.nbytes)
+                    self.gguf.memory_stats.add_host(host_weight_bytes)
+
+                    if not np.isfinite(weight_np).all():
+                        raise FloatingPointError(
+                            f"Non-finite weight values in {self.name}"
+                        )
+
+                    # CPU-only projections retain CPU decoded tiles. No
+                    # per-tile pinned-memory allocation is used.
+                    weight = torch.from_numpy(
+                        np.ascontiguousarray(weight_np)
+                    ).to(
+                        device=self.device,
+                        dtype=torch.float32,
+                    )
 
                 output[
                     :,
@@ -879,8 +942,7 @@ class TiledGGUFLinear:
                     weight.T,
                 )
             finally:
-                # Drop the CPU tensor view before ComfyUI truncates its
-                # HostBuffer backing allocation.
+                # Release the current decoded tile before reading the next one.
                 if weight is not None:
                     del weight
                 if vram_weight_bytes:
