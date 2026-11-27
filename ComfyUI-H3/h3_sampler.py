@@ -94,14 +94,35 @@ class H3Sampler:
             # Update first so the UI reflects the just-finished block, then
             # raise ComfyUI's own interruption exception if Cancel was pressed.
             progress.update_absolute(completed, total)
+
+            # The live tile counter is exposed through ModelPatcher.loaded_size().
+            # At block boundaries tiles have been released, so also report the
+            # measured peak reached during the preceding five-block interval.
+            if completed % 5 == 0 or completed == total:
+                stats = handle.gguf.memory_stats.snapshot()
+                mib = 1024.0 * 1024.0
+                managed_size = model.model_size()
+                loaded_vram = model.loaded_size()
+                offloaded_vram = max(0, managed_size - loaded_vram)
+                print(
+                    "[H3 ComfyUI Model Management] "
+                    f"stream working set: {loaded_vram / mib:.2f} MiB loaded / "
+                    f"{offloaded_vram / mib:.2f} MiB offloaded; "
+                    f"peak streamed tile: {stats['peak_vram_bytes'] / mib:.2f} MiB; "
+                    f"host staging: {stats['active_host_bytes'] / mib:.2f} MiB active "
+                    f"(peak {stats['peak_host_bytes'] / mib:.2f} MiB); "
+                    f"GGUF mmap: {handle.file_size / (1024 ** 2):.1f} MiB",
+                    flush=True,
+                )
             _check_interrupted()
 
         try:
             _check_interrupted()
 
-            # Register the actual H3 transformer runtime with ComfyUI's model
-            # manager. The patcher owns this runtime; its sample() method below
-            # performs the complete joint audio/video transformer execution.
+            # Reset per-sample high-water marks, then register the streamed
+            # runtime with ComfyUI's model manager. model_size() is the maximum
+            # concurrently resident tile, not the entire mmap checkpoint.
+            handle.gguf.memory_stats.reset_peaks()
             import comfy.model_management
             comfy.model_management.load_models_gpu([model], memory_required=0)
 
