@@ -566,6 +566,67 @@ def load_sampler_latents(input_path):
 
 
 # ---------------------------------------------------------------------
+# Audio latent / decoder diagnostics
+# ---------------------------------------------------------------------
+
+def print_latent_diagnostics(latent, model):
+    """Print normalized and denormalized stats per channel and stereo side."""
+    mean = model.latents_mean.detach().float().cpu()
+    std = model.latents_std.detach().float().cpu()
+    z = latent.detach().float().cpu()
+
+    if mean.shape != (32,) or std.shape != (32,):
+        raise RuntimeError(
+            f"Unexpected latent normalization buffers: "
+            f"mean={tuple(mean.shape)}, std={tuple(std.shape)}"
+        )
+    if not torch.isfinite(mean).all() or not torch.isfinite(std).all():
+        raise RuntimeError("Latent normalization buffers contain NaN/Inf.")
+    if not bool((std > 0).all()):
+        raise RuntimeError("Latent normalization std must be positive.")
+
+    print("\n========== AUDIO LATENT CHANNEL DIAGNOSTICS ==========")
+    print("Channel | L normalized mean/std | R normalized mean/std | "
+          "checkpoint mean/std")
+    for channel in range(32):
+        left = z[0, channel, 0]
+        right = z[0, channel, 1]
+        print(
+            f"{channel:02d} | "
+            f"L {left.mean().item():+.5f}/{left.std(unbiased=False).item():.5f} | "
+            f"R {right.mean().item():+.5f}/{right.std(unbiased=False).item():.5f} | "
+            f"{mean[channel].item():+.5f}/{std[channel].item():.5f}"
+        )
+
+    denorm = z * std.view(1, 32, 1, 1) + mean.view(1, 32, 1, 1)
+    for side, label in ((0, "LEFT"), (1, "RIGHT")):
+        values = denorm[0, :, side, :]
+        print(
+            f"Denormalized {label}: mean={values.mean().item():+.6f}, "
+            f"std={values.std(unbiased=False).item():.6f}, "
+            f"range={values.min().item():+.6f}..{values.max().item():+.6f}"
+        )
+
+
+def print_waveform_diagnostics(audio):
+    print("\n========== DECODED WAVEFORM DIAGNOSTICS ==========")
+    for side, label in ((0, "LEFT"), (1, "RIGHT")):
+        x = audio[side].detach().float().cpu()
+        rms = x.square().mean().sqrt()
+        print(
+            f"{label}: mean={x.mean().item():+.6f}, "
+            f"RMS={rms.item():.6f}, peak={x.abs().max().item():.6f}, "
+            f"clipped={(x.abs() >= 0.999).float().mean().item() * 100:.3f}%"
+        )
+    left = audio[0].detach().float().cpu()
+    right = audio[1].detach().float().cpu()
+    if left.numel() == right.numel() and left.std() > 0 and right.std() > 0:
+        correlation = torch.corrcoef(torch.stack((left, right)))[0, 1]
+        print(f"Stereo L/R correlation: {correlation.item():+.6f}")
+
+
+# ---------------------------------------------------------------------
+
 # WAV output
 # ---------------------------------------------------------------------
 
@@ -657,6 +718,7 @@ def main():
 
     print("\nDecoding stereo audio...")
     latent = latent.to(device=device, dtype=torch.float32)
+    print_latent_diagnostics(latent, model)
 
     with torch.inference_mode():
         decoded = model.decode(latent)
@@ -678,6 +740,7 @@ def main():
         f"{audio.min().item():.6f} .. {audio.max().item():.6f}"
     )
 
+    print_waveform_diagnostics(audio)
     save_stereo_wav(audio, args.output)
 
     print("\n========== AUDIO DECODE COMPLETE ==========")
