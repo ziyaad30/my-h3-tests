@@ -52,6 +52,11 @@ class H3Sampler:
             raise RuntimeError(
                 "H3 ModelPatcher does not contain an active H3 transformer runtime."
             )
+        # Capture the GGUF separately: the progress callback outlives this
+        # local handle reference while runtime.sample() is executing.
+        gguf = handle.gguf
+        gguf_file_size = handle.file_size
+
         if width <= 0 or height <= 0 or width % 32 or height % 32:
             raise ValueError("H3 width and height must be positive multiples of 32.")
         if frames < 5 or (frames - 5) % 17:
@@ -99,7 +104,7 @@ class H3Sampler:
             # At block boundaries tiles have been released, so also report the
             # measured peak reached during the preceding five-block interval.
             if completed % 5 == 0 or completed == total:
-                stats = handle.gguf.memory_stats.snapshot()
+                stats = gguf.memory_stats.snapshot()
                 mib = 1024.0 * 1024.0
                 managed_size = model.model_size()
                 loaded_vram = model.loaded_size()
@@ -111,7 +116,7 @@ class H3Sampler:
                     f"peak streamed tile: {stats['peak_vram_bytes'] / mib:.2f} MiB; "
                     f"host staging: {stats['active_host_bytes'] / mib:.2f} MiB active "
                     f"(peak {stats['peak_host_bytes'] / mib:.2f} MiB); "
-                    f"GGUF mmap: {handle.file_size / (1024 ** 2):.1f} MiB",
+                    f"GGUF mmap: {gguf_file_size / (1024 ** 2):.1f} MiB",
                     flush=True,
                 )
             _check_interrupted()
@@ -122,7 +127,7 @@ class H3Sampler:
             # Reset per-sample high-water marks, then register the streamed
             # runtime with ComfyUI's model manager. model_size() is the maximum
             # concurrently resident tile, not the entire mmap checkpoint.
-            handle.gguf.memory_stats.reset_peaks()
+            gguf.memory_stats.reset_peaks()
             import comfy.model_management
             comfy.model_management.load_models_gpu([model], memory_required=0)
 
