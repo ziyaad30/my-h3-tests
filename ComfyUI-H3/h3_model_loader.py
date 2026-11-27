@@ -277,6 +277,9 @@ class H3Transformer(torch.nn.Module):
         progress_callback=None,
         keyframes=None,
         lora=None,
+        fps=24.0,
+        video_shift=12.0,
+        audio_shift=3.0,
     ):
         """Execute joint H3 denoising through this ComfyUI-managed transformer."""
         import gc
@@ -305,6 +308,7 @@ class H3Transformer(torch.nn.Module):
                     seed=seed,
                     lora=lora,
                     transformer_blocks=self.blocks,
+                    fps=fps,
                 )
                 return run_h3_sampling(
                     engine=engine,
@@ -314,6 +318,8 @@ class H3Transformer(torch.nn.Module):
                     audio_t=audio_t,
                     steps=steps,
                     seed=seed,
+                    video_shift=video_shift,
+                    audio_shift=audio_shift,
                     progress_callback=progress_callback,
                 )
             finally:
