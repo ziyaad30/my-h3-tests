@@ -220,16 +220,6 @@ class H3TransformerRuntime(torch.nn.Module):
         )
 
 
-class _H3HostTileOwner:
-    """Ephemeral owner record required by ComfyUI's pinned-memory API."""
-
-    def __init__(self, pin_state):
-        self._pin_state = pin_state
-        self._pins = {}
-        self.weight = None
-        self.bias = None
-
-
 class H3ModelPatcher(ModelPatcherDynamic):
     """ComfyUI-managed lifecycle wrapper for the streamed H3 runtime."""
 
@@ -306,61 +296,6 @@ class H3ModelPatcher(ModelPatcherDynamic):
                 device_to,
                 memory_to_free=memory_to_free,
                 force_patch_weights=force_patch_weights,
-            )
-
-    def partially_unload_ram(self, ram_to_unload, subsets=None):
-        # Use ComfyUI's pin eviction implementation for H3's HostBuffer tiles.
-        if subsets is None:
-            freed = super().partially_unload_ram(ram_to_unload)
-        else:
-            freed = super().partially_unload_ram(ram_to_unload, subsets=subsets)
-        if freed and self.handle.gguf is not None:
-            self.handle.gguf.memory_stats.remove_host(freed)
-        return freed
-
-    def stage_host_tile(self, values):
-        # Allocate decoded FP32 tiles through ComfyUI's pinned HostBuffer
-        # manager so RAM pressure and pin eviction use the native APIs.
-        import comfy.pinned_memory
-
-        pin_state = self.model.dynamic_pins[self.load_device]
-        if not pin_state["hostbufs_initialized"]:
-            raise RuntimeError(
-                "H3 HostBuffers are not initialized. H3 ModelPatcher must be "
-                "loaded by comfy.model_management.load_models_gpu() first."
-            )
-
-        owner = _H3HostTileOwner(pin_state)
-        size = int(values.nbytes)
-        allocated = comfy.pinned_memory.pin_memory(
-            owner, subset="weights", size=size
-        )
-        pin = comfy.pinned_memory.get_pin(owner, subset="weights")
-        if not allocated or pin is None:
-            if "pin" in owner._pins.get("weights", {}):
-                self.partially_unload_ram(size, subsets=["weights"])
-            raise RuntimeError(
-                "ComfyUI could not allocate a managed pinned host tile for H3. "
-                "Check ComfyUI pinned-memory limits and available system RAM."
-            )
-
-        self.handle.gguf.memory_stats.add_host(size)
-        try:
-            target = pin.view(torch.float32).reshape(values.shape)
-            target.copy_(torch.from_numpy(values))
-        except Exception:
-            self.partially_unload_ram(size, subsets=["weights"])
-            raise
-
-        return {"owner": owner, "tensor": target, "size": size}
-
-    def release_host_tile(self, lease):
-        owner = lease["owner"]
-        # Drop our view before HostBuffer truncates the backing allocation.
-        lease["tensor"] = None
-        if "pin" in owner._pins.get("weights", {}):
-            self.partially_unload_ram(
-                lease["size"], subsets=["weights"]
             )
 
     def unpatch_model(self, device_to=None, unpatch_weights=True):
