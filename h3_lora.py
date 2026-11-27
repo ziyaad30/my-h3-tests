@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Memory-bounded loader for the official MiniMax-H3 FL2VA 4-step Turbo LoRA.
+"""Memory-bounded loader for MiniMax-H3 FL2VA Turbo-compatible LoRAs.
 
 Reads only the current token-refiner/DiT block from the safetensors file.
-No adapter-wide tensor dictionary is materialized or retained.
+No adapter-wide tensor dictionary is materialized or retained. By default,
+the production path enforces the known Turbo filename. The multi-LoRA
+preflight may opt into filename-independent validation, but all checkpoint
+keys, tensor shapes, rank, alpha metadata and supported key format remain
+strictly validated.
 """
 
 from __future__ import annotations
@@ -87,15 +91,21 @@ class H3LoRABlock:
 
 
 class H3TurboLoRA:
-    """Strictly validates the published 4-step v1.2 file and streams block pairs."""
+    """Strictly validates the H3 Turbo-compatible checkpoint schema."""
 
-    def __init__(self, path: str | Path, strength: float = 1.0):
+    def __init__(
+        self,
+        path: str | Path,
+        strength: float = 1.0,
+        *,
+        allow_compatible_filename: bool = False,
+    ):
         self.path = Path(path)
         self.strength = float(strength)
 
         if not self.path.is_file():
             raise FileNotFoundError(f"Turbo LoRA not found: {self.path}")
-        if self.path.name != EXPECTED_FILENAME:
+        if not allow_compatible_filename and self.path.name != EXPECTED_FILENAME:
             raise ValueError(
                 f"This loader is specifically for {EXPECTED_FILENAME}; "
                 f"received {self.path.name}"
@@ -177,7 +187,7 @@ class H3TurboLoRA:
                     )
 
         print(
-            f"Turbo LoRA validated: {self.path.name} | "
+            f"Turbo-compatible LoRA validated: {self.path.name} | "
             f"312 target pairs | rank={self.rank} | "
             f"alpha source={'per-layer tensors' if any(k.endswith('.alpha') for k in actual) else 'file metadata'} | "
             f"strength={self.strength:g}",
