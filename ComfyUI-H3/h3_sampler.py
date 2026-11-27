@@ -41,19 +41,19 @@ class H3Sampler:
         from comfy.model_patcher import ModelPatcher
         if not isinstance(model, ModelPatcher):
             raise TypeError("H3 Sampler expects the MODEL output from H3 Model Loader.")
-        runtime = getattr(model, "model", None)
-        handle = getattr(runtime, "handle", None)
+        transformer = getattr(model, "model", None)
+        handle = getattr(transformer, "handle", None)
         if (
             handle is None
             or handle.closed
             or handle.gguf is None
-            or not callable(getattr(runtime, "sample", None))
+            or not callable(getattr(transformer, "sample", None))
         ):
             raise RuntimeError(
-                "H3 ModelPatcher does not contain an active H3 transformer runtime."
+                "ComfyUI ModelPatcher does not contain an active H3 transformer."
             )
         # Capture the GGUF separately: the progress callback outlives this
-        # local handle reference while runtime.sample() is executing.
+        # local handle reference while transformer.sample() is executing.
         gguf = handle.gguf
         gguf_file_size = handle.file_size
 
@@ -100,9 +100,8 @@ class H3Sampler:
             # raise ComfyUI's own interruption exception if Cancel was pressed.
             progress.update_absolute(completed, total)
 
-            # The live tile counter is exposed through ModelPatcher.loaded_size().
-            # At block boundaries tiles have been released, so also report the
-            # measured peak reached during the preceding five-block interval.
+            # ModelPatcher.loaded_size() reports the transformer's reserved
+            # working-set estimate. StreamMemoryStats reports actual live tiles.
             if completed % 5 == 0 or completed == total:
                 stats = gguf.memory_stats.snapshot()
                 mib = 1024.0 * 1024.0
@@ -111,8 +110,9 @@ class H3Sampler:
                 offloaded_vram = max(0, managed_size - loaded_vram)
                 print(
                     "[H3 ComfyUI Model Management] "
-                    f"stream working set: {loaded_vram / mib:.2f} MiB loaded / "
-                    f"{offloaded_vram / mib:.2f} MiB offloaded; "
+                    f"transformer working-set reservation: "
+                    f"{loaded_vram / mib:.2f} MiB accounted / "
+                    f"{offloaded_vram / mib:.2f} MiB unaccounted; "
                     f"peak streamed tile: {stats['peak_vram_bytes'] / mib:.2f} MiB; "
                     f"host staging: {stats['active_host_bytes'] / mib:.2f} MiB active "
                     f"(peak {stats['peak_host_bytes'] / mib:.2f} MiB); "
@@ -124,9 +124,8 @@ class H3Sampler:
         try:
             _check_interrupted()
 
-            # Reset per-sample high-water marks, then register the streamed
-            # runtime with ComfyUI's model manager. model_size() is the maximum
-            # concurrently resident tile, not the entire mmap checkpoint.
+            # Reset per-sample high-water marks, then register the H3
+            # transformer ModelPatcher with ComfyUI's model manager.
             gguf.memory_stats.reset_peaks()
             import comfy.model_management
             comfy.model_management.load_models_gpu([model], memory_required=0)
@@ -137,7 +136,7 @@ class H3Sampler:
                 flush=True,
             )
             del handle
-            video_latent, audio_latent, elapsed, _, _ = runtime.sample(
+            video_latent, audio_latent, elapsed, _, _ = transformer.sample(
                 text_states=text_states,
                 keyframes=[],
                 latent_t=latent_t,
