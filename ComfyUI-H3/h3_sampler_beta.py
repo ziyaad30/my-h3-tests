@@ -28,6 +28,8 @@ class H3SamplerBeta:
                 "frames": ("INT", {"default": 22, "min": 5, "max": 1000, "step": 17}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.1}),
                 "steps": ("INT", {"default": 7, "min": 1, "max": 100}),
+                "trim_working_set": ("BOOLEAN", {"default": False}),
+                "trim_interval_blocks": ("INT", {"default": 10, "min": 1, "max": 50}),
                 "video_shift": ("FLOAT", {"default": 12.0, "min": 0.01, "max": 100.0, "step": 0.01}),
                 "audio_shift": ("FLOAT", {"default": 3.0, "min": 0.01, "max": 100.0, "step": 0.01}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
@@ -46,6 +48,7 @@ class H3SamplerBeta:
     @torch.inference_mode()
     def sample(
         self, model, conditioning, width, height, frames, fps, steps,
+        trim_working_set, trim_interval_blocks,
         video_shift, audio_shift, seed, lora=None
     ):
         if not torch.cuda.is_available():
@@ -132,7 +135,9 @@ class H3SamplerBeta:
             print(
                 f"[H3 Sampler Beta] {width}x{height}, {frames} frames at {fps:g} FPS, "
                 f"{steps} evaluations, video shift={video_shift:g}, "
-                f"audio shift={audio_shift:g}, seed={seed}",
+                f"audio shift={audio_shift:g}, seed={seed}; "
+                f"RAM trim={'on' if trim_working_set else 'off'}"
+                + (f" every {trim_interval_blocks} blocks" if trim_working_set else ""),
                 flush=True,
             )
             video_latent, audio_latent, elapsed, _, _ = transformer.sample(
@@ -148,6 +153,8 @@ class H3SamplerBeta:
                 fps=float(fps),
                 video_shift=float(video_shift),
                 audio_shift=float(audio_shift),
+                trim_working_set=bool(trim_working_set),
+                trim_interval_blocks=int(trim_interval_blocks),
                 progress_callback=update_progress,
             )
             del text_states
