@@ -951,6 +951,15 @@ class H3InferenceEngine:
                 gc.collect()
                 torch.cuda.empty_cache()
 
+                # Sample memory after each five-block group has been
+                # cleaned up, so RAM growth can be compared across blocks.
+                memory_label = (
+                    f"step {step_index}/{total_steps} | "
+                    f"after transformer block {block_index + 1}/{NUM_BLOCKS}"
+                )
+                report_system_memory(memory_label)
+                report_cuda_memory(f"CUDA MEMORY: {memory_label}")
+
         transformer_elapsed = time.perf_counter() - start_time
         print(f"50-block transformer elapsed: {transformer_elapsed:.2f}s")
 
