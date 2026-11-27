@@ -1,14 +1,16 @@
-"""MiniMax H3 transformer checkpoint loader.
+"""MiniMax H3 streamed checkpoint loader and ComfyUI ModelPatcher bridge.
 
-This is intentionally a checkpoint-reader stage, not yet a ComfyUI ModelPatcher.
-It memory-maps the H3 GGUF and validates its architecture without materializing
-the transformer weights. ModelPatcher integration belongs in the subsequent
-H3 model implementation once its streamed block modules are patchable.
+The checkpoint remains memory-mapped; transformer weights are streamed from
+GGUF row tiles by the H3 inference engine instead of being loaded as a full
+torch module.
 """
 
 import os
+import threading
 
+import torch
 import folder_paths
+from comfy.model_patcher import ModelPatcher
 
 # ---------------------------------------------------------------------------
 # Streamed H3 transformer checkpoint loader
@@ -103,8 +105,10 @@ class H3ModelHandle:
 
     def __init__(self, path):
         self.path = os.path.abspath(path)
+        self.file_size = os.path.getsize(self.path)
         self.gguf = None
         self.closed = False
+        self.execution_lock = threading.RLock()
 
         reader_class = _load_h3_gguf_reader()
         try:
@@ -116,20 +120,105 @@ class H3ModelHandle:
             raise
 
     def close(self):
-        if self.closed:
-            return
-        self.closed = True
-        gguf = self.gguf
-        self.gguf = None
-        if gguf is not None:
-            gguf.close()
-        print("[H3 Model Loader] Checkpoint mapping released.", flush=True)
+        with self.execution_lock:
+            if self.closed:
+                return
+            self.closed = True
+            gguf = self.gguf
+            self.gguf = None
+            if gguf is not None:
+                gguf.close()
+            print("[H3 Model Loader] Checkpoint mapping released.", flush=True)
 
     def __del__(self):
         try:
             self.close()
         except Exception:
             pass
+
+
+class H3Transformer(torch.nn.Module):
+    """Streamed H3 transformer owned directly by ComfyUI's ModelPatcher.
+
+    Transformer weights remain in the read-only GGUF mapping and are streamed
+    by H3InferenceEngine. This module intentionally has no Parameter tensors,
+    so ComfyUI must not move or materialize the checkpoint as a torch model.
+    """
+
+    def __init__(self, handle):
+        super().__init__()
+        self.handle = handle
+        self.working_set_bytes = int(handle.gguf.stream_working_set_bytes)
+        # Let ModelPatcher initialize this to its configured offload_device.
+        self.device = None
+
+    def get_dtype(self):
+        return torch.float32
+
+    @torch.inference_mode()
+    def sample(
+        self,
+        *,
+        text_states,
+        latent_t,
+        latent_h,
+        latent_w,
+        audio_t,
+        steps,
+        seed,
+        progress_callback=None,
+        keyframes=None,
+        lora=None,
+    ):
+        """Execute joint H3 denoising through this ComfyUI-managed transformer."""
+        import gc
+
+        from .h3_engine import (
+            H3InferenceEngine,
+            sample as run_h3_sampling,
+            validate_checkpoint,
+        )
+
+        with self.handle.execution_lock:
+            if self.handle.closed or self.handle.gguf is None:
+                raise RuntimeError("H3 transformer checkpoint is closed.")
+
+            engine = None
+            try:
+                validate_checkpoint(self.handle.gguf)
+                engine = H3InferenceEngine(
+                    gguf=self.handle.gguf,
+                    text_states=text_states,
+                    keyframes=[] if keyframes is None else keyframes,
+                    latent_t=latent_t,
+                    latent_h=latent_h,
+                    latent_w=latent_w,
+                    audio_t=audio_t,
+                    seed=seed,
+                    lora=lora,
+                )
+                return run_h3_sampling(
+                    engine=engine,
+                    latent_t=latent_t,
+                    latent_h=latent_h,
+                    latent_w=latent_w,
+                    audio_t=audio_t,
+                    steps=steps,
+                    seed=seed,
+                    progress_callback=progress_callback,
+                )
+            finally:
+                if engine is not None:
+                    del engine
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+    def forward(self, *args, **kwargs):
+        raise RuntimeError(
+            "H3 is a streamed joint audio/video transformer. Execute it with "
+            "H3 Sampler, which calls the managed transformer's sample() method."
+        )
 
 
 # Register a dedicated dropdown without changing ComfyUI's normal GGUF lists.
@@ -152,7 +241,7 @@ class H3ModelLoader:
             }
         }
 
-    RETURN_TYPES = ("H3_MODEL",)
+    RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "load_model"
     CATEGORY = "MiniMax H3/Model"
@@ -172,4 +261,23 @@ class H3ModelLoader:
             )
 
         handle = H3ModelHandle(path)
-        return (handle,)
+
+        # The standard ComfyUI ModelPatcher owns the H3 transformer module.
+        # The GGUF reader remains only the transformer's streamed checkpoint source.
+        import comfy.model_management
+
+        transformer = H3Transformer(handle)
+        patcher = ModelPatcher(
+            transformer,
+            load_device=comfy.model_management.get_torch_device(),
+            offload_device=comfy.model_management.unet_offload_device(),
+            size=transformer.working_set_bytes,
+        )
+        print(
+            f"[H3 Model Loader] Registered streamed MODEL with ComfyUI "
+            f"(GGUF mmap: {handle.file_size / (1024 ** 3):.2f} GiB; "
+            f"maximum managed FP32 weight tile: "
+            f"{transformer.working_set_bytes / (1024 ** 2):.2f} MiB).",
+            flush=True,
+        )
+        return (patcher,)

@@ -36,6 +36,7 @@ import argparse
 import mmap
 import os
 import struct
+import threading
 import time
 
 import numpy as np
@@ -128,6 +129,69 @@ class Tensor:
 
 
 # ============================================================
+# STREAMED MEMORY ACCOUNTING
+# ============================================================
+
+class StreamMemoryStats:
+    """Tracks live host staging buffers and live CUDA weight tiles."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.active_vram_bytes = 0
+        self.peak_vram_bytes = 0
+        self.active_host_bytes = 0
+        self.peak_host_bytes = 0
+
+    def add_vram(self, size):
+        size = int(size)
+        if size <= 0:
+            return
+        with self._lock:
+            self.active_vram_bytes += size
+            self.peak_vram_bytes = max(self.peak_vram_bytes, self.active_vram_bytes)
+
+    def remove_vram(self, size):
+        size = int(size)
+        if size <= 0:
+            return
+        with self._lock:
+            self.active_vram_bytes -= size
+            if self.active_vram_bytes < 0:
+                raise RuntimeError("H3 VRAM tile accounting underflow")
+
+    def add_host(self, size):
+        size = int(size)
+        if size <= 0:
+            return
+        with self._lock:
+            self.active_host_bytes += size
+            self.peak_host_bytes = max(self.peak_host_bytes, self.active_host_bytes)
+
+    def remove_host(self, size):
+        size = int(size)
+        if size <= 0:
+            return
+        with self._lock:
+            self.active_host_bytes -= size
+            if self.active_host_bytes < 0:
+                raise RuntimeError("H3 host tile accounting underflow")
+
+    def reset_peaks(self):
+        with self._lock:
+            self.peak_vram_bytes = self.active_vram_bytes
+            self.peak_host_bytes = self.active_host_bytes
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "active_vram_bytes": self.active_vram_bytes,
+                "peak_vram_bytes": self.peak_vram_bytes,
+                "active_host_bytes": self.active_host_bytes,
+                "peak_host_bytes": self.peak_host_bytes,
+            }
+
+
+# ============================================================
 # GGUF READER
 # ============================================================
 
@@ -143,6 +207,8 @@ class GGUF:
         self.alignment = 32
         self.data_offset = 0
         self.tensors = {}
+        self.memory_stats = StreamMemoryStats()
+        self.stream_working_set_bytes = 0
 
         self.open()
         self.parse()
@@ -315,6 +381,17 @@ class GGUF:
                     f"Tensor outside file: {t.name}"
                 )
 
+        # ComfyUI manages the maximum simultaneously resident weight tile,
+        # not the complete disk-backed GGUF. The CUDA path enforces 128 rows.
+        for tensor in self.tensors.values():
+            if len(tensor.dims) != 2:
+                continue
+            rows = min(128, tensor.output_rows)
+            tile_bytes = rows * tensor.input_width * 4
+            self.stream_working_set_bytes = max(
+                self.stream_working_set_bytes, tile_bytes
+            )
+
     def read_tensor_rows(self, name, first_row, row_count):
         t = self.tensors[name]
 
@@ -357,7 +434,9 @@ class GGUF:
 
         end = start + row_count * bytes_per_row
 
-        return bytes(self.mm[start:end])
+        # Return a zero-copy view over the read-only mmap. The OS manages
+        # mmap page residency; only the decoded tile is H3 host staging.
+        return memoryview(self.mm)[start:end]
 
     def close(self):
         if self.mm is not None:
@@ -575,6 +654,59 @@ def decode_q2k(raw):
 
 
 # ============================================================
+# CUDA Q2_K DECODER
+# ============================================================
+
+@torch.inference_mode()
+def _decode_q2k_torch(raw, row_count, input_width, device):
+    """
+    Transfer the compact Q2_K bytes to the target device and decode there.
+
+    The CUDA transformer path must not dequantize every streamed weight tile
+    on the CPU. Only the compressed mmap slice is copied from host memory;
+    the expanded FP32 tile is produced on the target device.
+    """
+    if input_width % Q2K_BLOCK_ELEMENTS:
+        raise ValueError(f"Q2_K input width is not block-aligned: {input_width}")
+
+    block_count = row_count * (input_width // Q2K_BLOCK_ELEMENTS)
+    raw_array = np.frombuffer(raw, dtype=np.uint8)
+    expected_bytes = block_count * Q2K_BLOCK_BYTES
+    if raw_array.size != expected_bytes:
+        raise ValueError(
+            f"Q2_K tile byte count mismatch: {raw_array.size} != {expected_bytes}"
+        )
+
+    # Copy only compressed bytes out of the read-only mmap before transfer.
+    packed = torch.from_numpy(raw_array.copy()).to(device=device)
+    blocks = packed.view(block_count, Q2K_BLOCK_BYTES)
+
+    scales = blocks[:, :16].to(torch.int32).view(block_count, 2, 4, 2)
+    quant = blocks[:, 16:80].to(torch.int32).view(block_count, 2, 2, 16)
+
+    # Each Q2_K block ends with two FP16 values: d and dmin.
+    factors = blocks[:, 80:84].contiguous().view(torch.float16).to(torch.float32)
+    d = factors[:, 0].view(block_count, 1, 1, 1)
+    dmin = factors[:, 1].view(block_count, 1, 1, 1)
+
+    shifts = torch.tensor((0, 2, 4, 6), dtype=torch.int32, device=device)
+    quant_values = (
+        (quant.unsqueeze(2) >> shifts.view(1, 1, 4, 1, 1)) & 3
+    ).to(torch.float32)
+
+    scale_low = (scales & 15).to(torch.float32)
+    scale_high = (scales >> 4).to(torch.float32)
+    multipliers = d * scale_low
+    minima = dmin * scale_high
+
+    decoded = (
+        multipliers.unsqueeze(-1) * quant_values
+        - minima.unsqueeze(-1)
+    )
+    return decoded.reshape(row_count, input_width)
+
+
+# ============================================================
 # OTHER GGML WEIGHT DECODERS
 # ============================================================
 
@@ -746,42 +878,83 @@ class TiledGGUFLinear:
                 self.output_rows - row_start,
             )
 
-            raw = self.gguf.read_tensor_rows(
-                self.name,
-                row_start,
-                rows,
-            )
+            raw = None
+            weight_np = None
+            weight = None
+            raw_bytes = 0
+            host_weight_bytes = 0
+            vram_weight_bytes = 0
 
-            weight_np = decode_weight_tile(
-                raw,
-                self.ggml_type,
-                rows,
-                self.input_width,
-            )
-
-            if not np.isfinite(weight_np).all():
-                raise FloatingPointError(
-                    f"Non-finite weight values in {self.name}"
+            try:
+                raw = self.gguf.read_tensor_rows(
+                    self.name,
+                    row_start,
+                    rows,
                 )
+                # raw is a memoryview into the mmap, not a copied host buffer.
+                raw_bytes = 0
 
-            weight = torch.from_numpy(
-                np.ascontiguousarray(weight_np)
-            ).to(
-                device=self.device,
-                dtype=torch.float32,
-            )
+                if self.ggml_type == TYPE_Q2_K and self.device.type == "cuda":
+                    # Decode the dominant quantized transformer weights on CUDA.
+                    # CPU projections retain the measured Numba decoder path.
+                    weight = _decode_q2k_torch(
+                        raw,
+                        rows,
+                        self.input_width,
+                        self.device,
+                    )
+                    vram_weight_bytes = weight.numel() * weight.element_size()
+                    self.gguf.memory_stats.add_vram(vram_weight_bytes)
 
-            output[
-                :,
-                row_start:row_start + rows,
-            ] = torch.matmul(
-                activation,
-                weight.T,
-            )
+                    if not torch.isfinite(weight).all().item():
+                        raise FloatingPointError(
+                            f"Non-finite decoded CUDA weight tile in {self.name}"
+                        )
+                else:
+                    weight_np = decode_weight_tile(
+                        raw,
+                        self.ggml_type,
+                        rows,
+                        self.input_width,
+                    )
+                    host_weight_bytes = int(weight_np.nbytes)
+                    self.gguf.memory_stats.add_host(host_weight_bytes)
 
-            del raw
-            del weight_np
-            del weight
+                    if not np.isfinite(weight_np).all():
+                        raise FloatingPointError(
+                            f"Non-finite weight values in {self.name}"
+                        )
+
+                    # CPU-only projections retain CPU decoded tiles. No
+                    # per-tile pinned-memory allocation is used.
+                    weight = torch.from_numpy(
+                        np.ascontiguousarray(weight_np)
+                    ).to(
+                        device=self.device,
+                        dtype=torch.float32,
+                    )
+
+                output[
+                    :,
+                    row_start:row_start + rows,
+                ] = torch.matmul(
+                    activation,
+                    weight.T,
+                )
+            finally:
+                # Release the current decoded tile before reading the next one.
+                if weight is not None:
+                    del weight
+                if vram_weight_bytes:
+                    self.gguf.memory_stats.remove_vram(vram_weight_bytes)
+                if host_weight_bytes:
+                    self.gguf.memory_stats.remove_host(host_weight_bytes)
+                if weight_np is not None:
+                    del weight_np
+                if raw_bytes:
+                    self.gguf.memory_stats.remove_host(raw_bytes)
+                if raw is not None:
+                    del raw
 
         return output
 

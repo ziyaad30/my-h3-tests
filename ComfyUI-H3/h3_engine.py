@@ -4,7 +4,6 @@ import ctypes
 import gc
 import math
 import time
-from pathlib import Path
 import numpy as np
 import torch
 from .h3_stream_linear import DEFAULT_GGUF, GGUF, TiledGGUFLinear
@@ -16,20 +15,8 @@ from .h3_transformer_ops import (
 from .h3_scheduler import H3FlowScheduler
 from .h3_lora import H3TurboLoRA
 
-# Paths and verified H3 constants
+# Verified H3 architecture constants
 # ---------------------------------------------------------------------------
-
-QWEN_MODEL_DEFAULT = Path(
-    "C:/Users/User/PycharmProjects/anotherVideo/lingbot_models/"
-    "models--bartowski--Qwen_Qwen3-VL-4B-Instruct-GGUF/"
-    "snapshots/30cab06d3c6ade289ddc97a9d7c75c2b847ff32a/"
-    "Qwen_Qwen3-VL-4B-Instruct-Q4_K_M.gguf"
-)
-
-CLIP_PROJECTION_DEFAULT = Path(
-    "C:/Users/User/PycharmProjects/pythonProject/models/"
-    "clip_projections/mmh3-4b-ClipProj-v3.1.safetensors"
-)
 
 HIDDEN_SIZE = 5376
 TEXT_INPUT_SIZE = 5120
@@ -641,6 +628,7 @@ class H3InferenceEngine:
         sigma_audio: float,
         step_index: int,
         total_steps: int,
+        progress_callback=None,
     ):
         require(tuple(video_latent.shape) == (
             1, 24, self.latent_t, self.latent_h, self.latent_w
@@ -735,6 +723,18 @@ class H3InferenceEngine:
 
             del block, modulation_table, adaln_indices
             torch.cuda.synchronize()
+
+            # Report each completed transformer block to ComfyUI. The node's
+            # callback also checks the global interrupt flag, so Cancel is
+            # honoured at the next block boundary rather than after all 50.
+            if progress_callback is not None:
+                completed_blocks = (
+                    (step_index - 1) * NUM_BLOCKS + block_index + 1
+                )
+                progress_callback(
+                    completed_blocks,
+                    total_steps * NUM_BLOCKS,
+                )
 
             if block_index == 0 or (block_index + 1) % 5 == 0:
                 print(
@@ -844,6 +844,7 @@ def sample(
     steps: int,
     seed: int,
     video_shift: float = VIDEO_SHIFT,
+    progress_callback=None,
 ):
     video_scheduler = H3FlowScheduler(shift=video_shift)
     audio_scheduler = H3FlowScheduler(shift=AUDIO_SHIFT)
@@ -912,6 +913,7 @@ def sample(
             sigma_audio=sigma_audio,
             step_index=index + 1,
             total_steps=steps,
+            progress_callback=progress_callback,
         )
 
         video_latent = video_scheduler.step(

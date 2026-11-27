@@ -1,14 +1,24 @@
 """ComfyUI node for streamed joint MiniMax H3 audio/video sampling."""
 import gc
+
 import torch
-from .h3_engine import H3InferenceEngine, sample as run_h3_sampling, validate_checkpoint
+
+from .h3_engine import NUM_BLOCKS
+
+
+def _check_interrupted():
+    """Raise ComfyUI's native interruption exception when Cancel is requested."""
+    import comfy.model_management
+
+    comfy.model_management.throw_exception_if_processing_interrupted()
+
 
 class H3Sampler:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model": ("H3_MODEL",),
+                "model": ("MODEL",),
                 "conditioning": ("CONDITIONING",),
                 "width": ("INT", {"default": 480, "min": 32, "max": 4096, "step": 32}),
                 "height": ("INT", {"default": 256, "min": 32, "max": 4096, "step": 32}),
@@ -18,7 +28,7 @@ class H3Sampler:
             }
         }
 
-    RETURN_TYPES = ("H3_VIDEO_LATENT", "H3_AUDIO_LATENT")
+    RETURN_TYPES = ("LATENT", "LATENT")
     RETURN_NAMES = ("video_latent", "audio_latent")
     FUNCTION = "sample"
     CATEGORY = "MiniMax H3/Sampling"
@@ -28,14 +38,38 @@ class H3Sampler:
     def sample(self, model, conditioning, width, height, frames, steps, seed):
         if not torch.cuda.is_available():
             raise RuntimeError("H3 sampling requires CUDA; no CUDA device is available.")
-        if getattr(model, "closed", True) or getattr(model, "gguf", None) is None:
-            raise RuntimeError("H3 model handle is closed or has no mapped GGUF checkpoint.")
+        from comfy.model_patcher import ModelPatcher
+        if not isinstance(model, ModelPatcher):
+            raise TypeError("H3 Sampler expects the MODEL output from H3 Model Loader.")
+        transformer = getattr(model, "model", None)
+        handle = getattr(transformer, "handle", None)
+        if (
+            handle is None
+            or handle.closed
+            or handle.gguf is None
+            or not callable(getattr(transformer, "sample", None))
+        ):
+            raise RuntimeError(
+                "ComfyUI ModelPatcher does not contain an active H3 transformer."
+            )
+        # Capture the GGUF separately: the progress callback outlives this
+        # local handle reference while transformer.sample() is executing.
+        gguf = handle.gguf
+        gguf_file_size = handle.file_size
+
         if width <= 0 or height <= 0 or width % 32 or height % 32:
             raise ValueError("H3 width and height must be positive multiples of 32.")
         if frames < 5 or (frames - 5) % 17:
             raise ValueError("H3 frame count must be 5 + 17*n (for example 5, 22, 39).")
         if steps < 1:
             raise ValueError("At least one denoising evaluation is required.")
+
+        # Import inside execution so this module remains importable by static
+        # tooling without initializing ComfyUI's runtime.
+        from comfy.utils import ProgressBar
+
+        total_blocks = steps * NUM_BLOCKS
+        progress = ProgressBar(total_blocks)
 
         # H3Conditioning wraps the unprojected ClipProj tensor in standard ComfyUI CONDITIONING.
         if not isinstance(conditioning, (list, tuple)) or not conditioning:
@@ -61,25 +95,82 @@ class H3Sampler:
         if audio_t <= 0:
             raise ValueError("Invalid H3 audio latent temporal length.")
 
-        gguf = model.gguf
-        validate_checkpoint(gguf)
-        print(f"[H3 Sampler] {width}x{height}, {frames} frames, {steps} evaluations, seed={seed}", flush=True)
-        engine = H3InferenceEngine(
-            gguf=gguf, text_states=text_states, keyframes=[],
-            latent_t=latent_t, latent_h=latent_h, latent_w=latent_w,
-            audio_t=audio_t, seed=seed, lora=None,
-        )
-        del text_states
-        gc.collect()
-        video_latent, audio_latent, elapsed, _, _ = run_h3_sampling(
-            engine=engine, latent_t=latent_t, latent_h=latent_h, latent_w=latent_w,
-            audio_t=audio_t, steps=steps, seed=seed,
-        )
-        del engine
-        gc.collect()
-        torch.cuda.empty_cache()
-        print(f"[H3 Sampler] Joint audio/video sampling completed in {elapsed:.2f}s.", flush=True)
-        return (
-            video_latent.detach().to(device="cpu", dtype=torch.float32).contiguous(),
-            audio_latent.detach().to(device="cpu", dtype=torch.float32).contiguous(),
-        )
+        def update_progress(completed, total):
+            # Update first so the UI reflects the just-finished block, then
+            # raise ComfyUI's own interruption exception if Cancel was pressed.
+            progress.update_absolute(completed, total)
+
+            # ModelPatcher.loaded_size() reports the transformer's reserved
+            # working-set estimate. StreamMemoryStats reports actual live tiles.
+            if completed % 5 == 0 or completed == total:
+                stats = gguf.memory_stats.snapshot()
+                mib = 1024.0 * 1024.0
+                managed_size = model.model_size()
+                loaded_vram = model.loaded_size()
+                offloaded_vram = max(0, managed_size - loaded_vram)
+                print(
+                    "[H3 ComfyUI Model Management] "
+                    f"transformer working-set reservation: "
+                    f"{loaded_vram / mib:.2f} MiB accounted / "
+                    f"{offloaded_vram / mib:.2f} MiB unaccounted; "
+                    f"peak streamed tile: {stats['peak_vram_bytes'] / mib:.2f} MiB; "
+                    f"host staging: {stats['active_host_bytes'] / mib:.2f} MiB active "
+                    f"(peak {stats['peak_host_bytes'] / mib:.2f} MiB); "
+                    f"GGUF mmap: {gguf_file_size / (1024 ** 2):.1f} MiB",
+                    flush=True,
+                )
+            _check_interrupted()
+
+        try:
+            _check_interrupted()
+
+            # Reset per-sample high-water marks, then register the H3
+            # transformer ModelPatcher with ComfyUI's model manager.
+            gguf.memory_stats.reset_peaks()
+            import comfy.model_management
+            comfy.model_management.load_models_gpu([model], memory_required=0)
+
+            print(
+                f"[H3 Sampler] {width}x{height}, {frames} frames, "
+                f"{steps} evaluations, seed={seed}",
+                flush=True,
+            )
+            del handle
+            video_latent, audio_latent, elapsed, _, _ = transformer.sample(
+                text_states=text_states,
+                keyframes=[],
+                latent_t=latent_t,
+                latent_h=latent_h,
+                latent_w=latent_w,
+                audio_t=audio_t,
+                steps=steps,
+                seed=seed,
+                lora=None,
+                progress_callback=update_progress,
+            )
+            del text_states
+            gc.collect()
+            _check_interrupted()
+            print(
+                f"[H3 Sampler] Joint audio/video sampling completed in {elapsed:.2f}s.",
+                flush=True,
+            )
+            # Standard ComfyUI LATENT payloads. Keeping the two modalities
+            # separate makes each output directly consumable by compatible
+            # video/audio latent decoder nodes.
+            return (
+                {
+                    "samples": video_latent.detach().to(
+                        device="cpu", dtype=torch.float32
+                    ).contiguous(),
+                },
+                {
+                    "samples": audio_latent.detach().to(
+                        device="cpu", dtype=torch.float32
+                    ).contiguous(),
+                },
+            )
+        finally:
+            # The managed transformer owns engine cleanup and its execution lock.
+            gc.collect()
+            torch.cuda.empty_cache()
