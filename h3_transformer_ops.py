@@ -432,7 +432,7 @@ class H3TransformerBlock:
             gguf,
             block_index,
             device="cpu",
-            row_tile=DEFAULT_ROW_TILE,
+            row_tile=2048,
             token_tile=DEFAULT_TOKEN_TILE,
             query_chunk=DEFAULT_QUERY_CHUNK,
             key_chunk=DEFAULT_KEY_CHUNK,
