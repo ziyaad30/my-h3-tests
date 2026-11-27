@@ -64,70 +64,11 @@ def validate_adapter_block(label: str, lora_block) -> None:
 
 
 @torch.inference_mode()
-def projection_deltas(lora_blocks, label: str):
-    """Apply each adapter to identical inputs and return per-adapter deltas."""
-    tokens = 2
-    hidden = torch.randn(tokens, HIDDEN_SIZE, dtype=torch.float32)
-    attn_input = torch.randn(tokens, INNER_SIZE, dtype=torch.float32)
-    fc2_input = torch.randn(tokens, MLP_HIDDEN_SIZE, dtype=torch.float32)
-
-    per_adapter = []
-    for adapter_index, lora_block in enumerate(lora_blocks):
-        adapter_label = f"{label} adapter {adapter_index + 1}"
-
-        qkv = torch.zeros(tokens, INNER_SIZE * 3, dtype=torch.float32)
-        lora_block.add_qkv(hidden, qkv)
-
-        out_proj = torch.zeros(tokens, HIDDEN_SIZE, dtype=torch.float32)
-        lora_block.add_linear("out_proj", attn_input, out_proj)
-
-        fc1 = torch.zeros(tokens, MLP_HIDDEN_SIZE * 2, dtype=torch.float32)
-        lora_block.add_linear("fc1", hidden, fc1)
-
-        fc2 = torch.zeros(tokens, HIDDEN_SIZE, dtype=torch.float32)
-        lora_block.add_linear("fc2", fc2_input, fc2)
-
-        for name, value in (("QKV", qkv), ("out_proj", out_proj),
-                            ("FC1", fc1), ("FC2", fc2)):
-            require(bool(torch.isfinite(value).all()),
-                    f"{adapter_label}: {name} produced NaN/Inf")
-            require(bool(torch.count_nonzero(value)),
-                    f"{adapter_label}: {name} produced a zero delta")
-
-        per_adapter.append((qkv, out_proj, fc1, fc2))
-
-    return per_adapter
-
-
-@torch.inference_mode()
 def check_additive_combination(label: str, lora_blocks) -> None:
     """Prove sequential multi-LoRA application equals the sum of deltas."""
     require(len(lora_blocks) >= 2, f"{label}: need at least two adapters")
-    individual = projection_deltas(lora_blocks, label)
 
-    names = ("QKV", "out_proj", "FC1", "FC2")
-    for projection_index, name in enumerate(names):
-        expected = torch.stack(
-            [item[projection_index] for item in individual], dim=0
-        ).sum(dim=0)
-
-        combined = torch.zeros_like(expected)
-        if projection_index == 0:
-            # Q, K and V are applied through the fused QKV helper.
-            tokens = combined.shape[0]
-            hidden = torch.randn(tokens, HIDDEN_SIZE, dtype=torch.float32)
-            # Recompute all adapters with the same hidden input below.
-            combined.zero_()
-            for lora_block in lora_blocks:
-                lora_block.add_qkv(hidden, combined)
-            # The comparison input must match the individual test inputs.
-            # projection_deltas returns its input-independent result only, so
-            # additive equality is checked in the dedicated shared-input pass.
-            del expected
-            continue
-
-    # Dedicated shared-input pass: use exactly the same inputs for each
-    # individual delta and the sequential combined application.
+    # Every adapter receives exactly the same synthetic activation tensors.
     tokens = 2
     hidden = torch.randn(tokens, HIDDEN_SIZE, dtype=torch.float32)
     attn_input = torch.randn(tokens, INNER_SIZE, dtype=torch.float32)
@@ -144,21 +85,27 @@ def check_additive_combination(label: str, lora_blocks) -> None:
         lora_block.add_linear("fc2", fc2_input, fc2)
         return qkv, out_proj, fc1, fc2
 
-    individual_shared = [apply_one(adapter) for adapter in lora_blocks]
-    combined = [torch.zeros_like(value) for value in individual_shared[0]]
+    individual = [apply_one(adapter) for adapter in lora_blocks]
+    combined = [torch.zeros_like(value) for value in individual[0]]
     for lora_block in lora_blocks:
         lora_block.add_qkv(hidden, combined[0])
         lora_block.add_linear("out_proj", attn_input, combined[1])
         lora_block.add_linear("fc1", hidden, combined[2])
         lora_block.add_linear("fc2", fc2_input, combined[3])
 
-    for index, name in enumerate(names):
+    for index, name in enumerate(("QKV", "out_proj", "FC1", "FC2")):
         expected = torch.stack(
-            [item[index] for item in individual_shared], dim=0
+            [item[index] for item in individual], dim=0
         ).sum(dim=0)
+        require(bool(torch.isfinite(combined[index]).all()),
+                f"{label}: combined {name} produced NaN/Inf")
         require(torch.allclose(combined[index], expected, rtol=1e-5, atol=1e-5),
                 f"{label}: combined {name} delta differs from sum of individual deltas")
-
+        for adapter_index, item in enumerate(individual, start=1):
+            require(bool(torch.isfinite(item[index]).all()),
+                    f"{label}: adapter {adapter_index} {name} produced NaN/Inf")
+            require(bool(torch.count_nonzero(item[index])),
+                    f"{label}: adapter {adapter_index} {name} produced zero delta")
 
 def get_block_lora_blocks(block, adapters, scope: str, index: int):
     """Use the block's first attached adapter plus block-local loads of the rest."""
