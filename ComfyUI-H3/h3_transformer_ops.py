@@ -419,7 +419,7 @@ def streamed_attention(
 # H3 TRANSFORMER BLOCK
 # ============================================================
 
-class H3TransformerBlock:
+class H3TransformerBlock(torch.nn.Module):
     """
     One streamed H3 transformer block.
 
@@ -438,6 +438,7 @@ class H3TransformerBlock:
             key_chunk=DEFAULT_KEY_CHUNK,
             lora=None,
     ):
+        super().__init__()
         self.gguf = gguf
         self.block_index = int(block_index)
 
@@ -476,20 +477,17 @@ class H3TransformerBlock:
         )
 
         # The norm vectors are small and remain resident.
-        self.norm1_weight = self._load_vector(
-            prefix + "norm1.weight"
+        self.register_buffer(
+            "norm1_weight", self._load_vector(prefix + "norm1.weight").to(self.device)
         )
-
-        self.norm2_weight = self._load_vector(
-            prefix + "norm2.weight"
+        self.register_buffer(
+            "norm2_weight", self._load_vector(prefix + "norm2.weight").to(self.device)
         )
-
-        self.q_norm_weight = self._load_vector(
-            prefix + "attn.q_norm.weight"
+        self.register_buffer(
+            "q_norm_weight", self._load_vector(prefix + "attn.q_norm.weight").to(self.device)
         )
-
-        self.k_norm_weight = self._load_vector(
-            prefix + "attn.k_norm.weight"
+        self.register_buffer(
+            "k_norm_weight", self._load_vector(prefix + "attn.k_norm.weight").to(self.device)
         )
 
         self._validate_checkpoint_shapes()
@@ -498,11 +496,21 @@ class H3TransformerBlock:
             if lora is not None else None
         )
 
-        self.norm1_weight = self.norm1_weight.to(self.device)
-        self.norm2_weight = self.norm2_weight.to(self.device)
 
-        self.q_norm_weight = self.q_norm_weight.to(self.device)
-        self.k_norm_weight = self.k_norm_weight.to(self.device)
+
+    def _apply(self, fn, recurse=True):
+        # Keep the streamed operators' execution device synchronized with
+        # ComfyUI ModelPatcher moving this registered block between devices.
+        result = super()._apply(fn, recurse=recurse)
+        self.device = self.norm1_weight.device
+        for projection in (self.qkv_proj, self.out_proj, self.fc1, self.fc2):
+            projection.device = self.device
+            projection.row_tile = (
+                max(projection.requested_row_tile, 128)
+                if self.device.type == "cuda"
+                else projection.requested_row_tile
+            )
+        return result
 
     def _linear(self, tensor_name):
         if tensor_name not in self.gguf.tensors:
@@ -580,7 +588,7 @@ class H3TransformerBlock:
                 )
 
     @torch.inference_mode()
-    def __call__(
+    def forward(
             self,
             hidden_states,
             modulation_table,
