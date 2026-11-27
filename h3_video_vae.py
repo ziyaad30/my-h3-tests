@@ -15,17 +15,19 @@ from pathlib import Path
 import torch
 
 
-# The repository keeps the standalone LightVAE implementation beside the
-# ComfyUI-H3 custom-node directory.
+# The standalone LightVAE package is shipped inside this custom-node
+# directory, beside nodes.py. The checkpoint directory remains in the project
+# root under models/vae.
+NODE_ROOT = Path(__file__).resolve().parent
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-LIGHTVAE_ROOT = REPOSITORY_ROOT / "lightvae_h3_standalone"
+LIGHTVAE_ROOT = NODE_ROOT / "lightvae_h3_standalone"
 MODEL_DIR = REPOSITORY_ROOT / "models" / "vae"
 DECODER_FILENAME = "lightvae-lite-h3-decoder.safetensors"
 DTYPE = torch.float16
 DEVICE = torch.device("cuda:0")
 
-if str(REPOSITORY_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPOSITORY_ROOT))
+if str(NODE_ROOT) not in sys.path:
+    sys.path.insert(0, str(NODE_ROOT))
 
 from lightvae_h3_standalone.lightvae.h3_lightvae_decoder import Decoder
 from lightvae_h3_standalone.lightvae.utils import h3_decoded_frames

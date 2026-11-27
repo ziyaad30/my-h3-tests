@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from h3_stream_linear import GGUF
+from .h3_stream_linear import GGUF
 
 
 HIDDEN_SIZE = 5376
