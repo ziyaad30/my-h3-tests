@@ -163,4 +163,3 @@ class H3SamplerBeta:
             )
         finally:
             gc.collect()
-            torch.cuda.empty_cache()
