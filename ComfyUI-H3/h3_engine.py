@@ -27,6 +27,7 @@ NUM_BLOCKS = 50
 
 VIDEO_SHIFT = 12.0
 AUDIO_SHIFT = 3.0
+DEFAULT_FPS = 24.0
 VISUAL_COND_TIMESTEP = 0.999
 
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
@@ -229,10 +230,13 @@ def frame_grid(latent_h: int, latent_w: int):
     return coordinates, w_axis
 
 
-def video_time_grid(latent_t: int, origin: float) -> torch.Tensor:
+def video_time_grid(latent_t: int, origin: float, fps: float = DEFAULT_FPS) -> torch.Tensor:
+    if not math.isfinite(float(fps)) or fps <= 0:
+        raise ValueError(f"fps must be a positive finite number, got {fps}")
+    temporal_scale = DEFAULT_FPS / float(fps)
     spans = torch.tensor(
         [
-            FRAME_RESCALE * FRAME_PER_TOKEN[index % len(FRAME_PER_TOKEN)]
+            FRAME_RESCALE * FRAME_PER_TOKEN[index % len(FRAME_PER_TOKEN)] * temporal_scale
             for index in range(latent_t)
         ],
         dtype=torch.float64,
@@ -242,11 +246,11 @@ def video_time_grid(latent_t: int, origin: float) -> torch.Tensor:
     )
 
 
-def video_grid(latent_t: int, frame_coordinates: torch.Tensor, origin: float):
+def video_grid(latent_t: int, frame_coordinates: torch.Tensor, origin: float, fps: float = DEFAULT_FPS):
     result = torch.empty(
         latent_t, frame_coordinates.shape[0], 3, dtype=torch.float64
     )
-    result[:, :, 0] = video_time_grid(latent_t, origin)[:, None]
+    result[:, :, 0] = video_time_grid(latent_t, origin, fps)[:, None]
     result[:, :, 1:] = frame_coordinates[None]
     return result.reshape(-1, 3)
 
@@ -271,7 +275,10 @@ def build_packed_layout(
     latent_w: int,
     audio_t: int,
     keyframes: list[dict],
+    fps: float = DEFAULT_FPS,
 ) -> dict:
+    if not math.isfinite(float(fps)) or fps <= 0:
+        raise ValueError(f"fps must be a positive finite number, got {fps}")
     frame_coordinates, width_axis = frame_grid(latent_h, latent_w)
     frame_rows = frame_coordinates.shape[0]
     origin = float(text_length)
@@ -302,7 +309,8 @@ def build_packed_layout(
             video_grid(
                 latent.shape[2],
                 frame_coordinates,
-                origin + FRAME_RESCALE * frame_index,
+                origin + FRAME_RESCALE * frame_index * (DEFAULT_FPS / float(fps)),
+                fps,
             )
         )
         row = end
@@ -324,7 +332,7 @@ def build_packed_layout(
     video_count = latent_t * frame_rows
     video_end = video_start + video_count
     segments.append((video_start, video_end, "video"))
-    positions.append(video_grid(latent_t, frame_coordinates, origin))
+    positions.append(video_grid(latent_t, frame_coordinates, origin, fps))
     row = video_end
 
     position_ids = torch.cat(positions, dim=0)
@@ -444,10 +452,21 @@ class H3InferenceEngine:
         audio_t: int,
         seed: int,
         lora: H3TurboLoRA | None = None,
+        transformer_blocks: torch.nn.ModuleList | None = None,
+        fps: float = DEFAULT_FPS,
     ):
         self.gguf = gguf
+        if transformer_blocks is None or len(transformer_blocks) != NUM_BLOCKS:
+            raise ValueError(
+                f"H3 requires {NUM_BLOCKS} registered transformer block modules."
+            )
+        self.transformer_blocks = transformer_blocks
         self.seed = int(seed)
         self.lora = lora
+        # Do not preload all 50 adapters: only the active block's factors are
+        # moved to the execution device, then released before the next block.
+        for block in self.transformer_blocks:
+            block.lora = None
         self.row_tile = CUDA_ROW_TILE
 
         self.layout = build_packed_layout(
@@ -457,6 +476,7 @@ class H3InferenceEngine:
             latent_w=latent_w,
             audio_t=audio_t,
             keyframes=keyframes,
+            fps=fps,
         )
 
         self.position_ids = self.layout["position_ids"]
@@ -700,28 +720,36 @@ class H3InferenceEngine:
                 device="cpu",
             )
 
-            block = H3TransformerBlock(
-                self.gguf,
-                block_index=block_index,
-                device="cuda:0",
-                row_tile=CUDA_ROW_TILE,
-                token_tile=TOKEN_TILE,
-                query_chunk=QUERY_CHUNK,
-                key_chunk=KEY_CHUNK,
-                lora=self.lora,
-            )
+            block = self.transformer_blocks[block_index]
 
-            # hidden stays in CPU RAM between blocks. The block moves its
-            # active working tensors to CUDA and returns the result to CPU.
-            hidden = block(
-                hidden,
-                modulation_table,
-                adaln_indices,
-                self.position_ids,
-                self.inv_freq,
-            )
+            # Stage only the active block's small norm buffers on CUDA.
+            # Projection matrices remain mmap-backed and are decoded by row
+            # tile; all inactive block buffers remain on CPU.
+            block.to(device="cuda:0")
+            try:
+                # Load only this block's LoRA factors. Keeping all 50 adapters
+                # resident would defeat the memory-bounded streamed execution.
+                if self.lora is not None:
+                    block.lora = self.lora.load_block(
+                        "blocks", block.block_index, block.device
+                    )
 
-            del block, modulation_table, adaln_indices
+                # hidden stays in CPU RAM between blocks. The active block
+                # computes on CUDA and returns its output to CPU.
+                hidden = block(
+                    hidden,
+                    modulation_table,
+                    adaln_indices,
+                    self.position_ids,
+                    self.inv_freq,
+                )
+            finally:
+                block.lora = None
+                # Return the block's norm buffers and projection device to CPU
+                # before the next block is staged.
+                block.to(device="cpu")
+
+            del modulation_table, adaln_indices
             torch.cuda.synchronize()
 
             # Report each completed transformer block to ComfyUI. The node's
@@ -844,10 +872,11 @@ def sample(
     steps: int,
     seed: int,
     video_shift: float = VIDEO_SHIFT,
+    audio_shift: float = AUDIO_SHIFT,
     progress_callback=None,
 ):
     video_scheduler = H3FlowScheduler(shift=video_shift)
-    audio_scheduler = H3FlowScheduler(shift=AUDIO_SHIFT)
+    audio_scheduler = H3FlowScheduler(shift=audio_shift)
 
     # set_timesteps receives sigma points, so steps+1 points produce
     # exactly the requested number of model evaluations.
@@ -881,7 +910,7 @@ def sample(
     print("Transformer blocks per evaluation:", NUM_BLOCKS)
     print("Total transformer block executions:", steps * NUM_BLOCKS)
     print("Video shift:", video_shift)
-    print("Audio shift:", AUDIO_SHIFT)
+    print("Audio shift:", audio_shift)
     print("Seed:", seed)
     print_stats("Initial video noise", video_latent)
     print_stats("Initial audio noise", audio_latent)
@@ -893,7 +922,7 @@ def sample(
         sigma_audio = float(audio_scheduler.sigmas[index].item())
 
         mapped_audio_sigma = time_shift_sigma(
-            sigma_video, video_shift, AUDIO_SHIFT
+            sigma_video, video_shift, audio_shift
         )
         require(
             abs(mapped_audio_sigma - sigma_audio) < 1e-6,

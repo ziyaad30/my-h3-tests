@@ -25,6 +25,9 @@ class H3Sampler:
                 "frames": ("INT", {"default": 22, "min": 5, "max": 1000, "step": 17}),
                 "steps": ("INT", {"default": 7, "min": 1, "max": 100}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
+            },
+            "optional": {
+                "lora": ("H3_LORA",),
             }
         }
 
@@ -35,13 +38,17 @@ class H3Sampler:
     TITLE = "H3 Sampler"
 
     @torch.inference_mode()
-    def sample(self, model, conditioning, width, height, frames, steps, seed):
+    def sample(self, model, conditioning, width, height, frames, steps, seed, lora=None):
         if not torch.cuda.is_available():
             raise RuntimeError("H3 sampling requires CUDA; no CUDA device is available.")
-        from comfy.model_patcher import ModelPatcher
-        if not isinstance(model, ModelPatcher):
-            raise TypeError("H3 Sampler expects the MODEL output from H3 Model Loader.")
-        transformer = getattr(model, "model", None)
+        from .h3_model_loader import H3ModelPatcher
+        if not isinstance(model, H3ModelPatcher):
+            raise TypeError(
+                "H3 Sampler requires the H3 ModelPatcher output from H3 Model Loader."
+            )
+        # The patcher owns the runtime and GGUF mapping. Sampling always runs
+        # through that exact managed transformer instance.
+        transformer = model.model
         handle = getattr(transformer, "handle", None)
         if (
             handle is None
@@ -50,7 +57,7 @@ class H3Sampler:
             or not callable(getattr(transformer, "sample", None))
         ):
             raise RuntimeError(
-                "ComfyUI ModelPatcher does not contain an active H3 transformer."
+                "H3 ModelPatcher does not contain an active H3 transformer runtime."
             )
         # Capture the GGUF separately: the progress callback outlives this
         # local handle reference while transformer.sample() is executing.
@@ -145,7 +152,7 @@ class H3Sampler:
                 audio_t=audio_t,
                 steps=steps,
                 seed=seed,
-                lora=None,
+                lora=lora,
                 progress_callback=update_progress,
             )
             del text_states

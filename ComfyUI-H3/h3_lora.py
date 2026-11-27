@@ -241,3 +241,50 @@ class H3TurboLoRA:
                 scales[target] = alpha / RANK * self.strength
 
         return H3LoRABlock(pairs, scales, device)
+
+
+
+class H3LoRALoader:
+    """Load and strictly validate a MiniMax H3 Turbo-compatible LoRA."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        import folder_paths
+
+        files = folder_paths.get_filename_list("loras")
+        if not files:
+            files = ["<put H3 Turbo LoRA in models/loras>"]
+        return {
+            "required": {
+                "lora_name": (files,),
+                "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.01}),
+            }
+        }
+
+    RETURN_TYPES = ("H3_LORA",)
+    RETURN_NAMES = ("lora",)
+    FUNCTION = "load_lora"
+    CATEGORY = "MiniMax H3/Model"
+    TITLE = "H3 LoRA Loader"
+
+    def load_lora(self, lora_name, strength):
+        import folder_paths
+
+        if lora_name.startswith("<put "):
+            raise RuntimeError(
+                "No H3 LoRA was found. Place the H3 Turbo-compatible "
+                "safetensors file in ComfyUI/models/loras and refresh ComfyUI."
+            )
+        path = folder_paths.get_full_path("loras", lora_name)
+        if path is None:
+            raise FileNotFoundError(f"Could not resolve H3 LoRA: {lora_name}")
+
+        # The key inventory, factor shapes, rank and alpha are still checked
+        # strictly. Filename compatibility is relaxed so users can rename a
+        # valid H3 adapter without changing its contents.
+        adapter = H3TurboLoRA(
+            path,
+            strength=float(strength),
+            allow_compatible_filename=True,
+        )
+        return (adapter,)
