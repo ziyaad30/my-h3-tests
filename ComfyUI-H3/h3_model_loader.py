@@ -137,7 +137,7 @@ class H3ModelHandle:
             pass
 
 
-class H3ModelRuntime(torch.nn.Module):
+class H3TransformerRuntime(torch.nn.Module):
     """Lightweight runtime object owned by ComfyUI's ModelPatcher.
 
     Transformer weights remain in the read-only GGUF mapping and are streamed
@@ -154,10 +154,69 @@ class H3ModelRuntime(torch.nn.Module):
     def get_dtype(self):
         return torch.float32
 
+    @torch.inference_mode()
+    def sample(
+        self,
+        *,
+        text_states,
+        latent_t,
+        latent_h,
+        latent_w,
+        audio_t,
+        steps,
+        seed,
+        progress_callback=None,
+        keyframes=None,
+        lora=None,
+    ):
+        """Execute joint H3 denoising through the transformer owned by this patcher."""
+        import gc
+
+        from .h3_engine import (
+            H3InferenceEngine,
+            sample as run_h3_sampling,
+            validate_checkpoint,
+        )
+
+        with self.handle.execution_lock:
+            if self.handle.closed or self.handle.gguf is None:
+                raise RuntimeError("H3 transformer checkpoint is closed.")
+
+            engine = None
+            try:
+                validate_checkpoint(self.handle.gguf)
+                engine = H3InferenceEngine(
+                    gguf=self.handle.gguf,
+                    text_states=text_states,
+                    keyframes=[] if keyframes is None else keyframes,
+                    latent_t=latent_t,
+                    latent_h=latent_h,
+                    latent_w=latent_w,
+                    audio_t=audio_t,
+                    seed=seed,
+                    lora=lora,
+                )
+                return run_h3_sampling(
+                    engine=engine,
+                    latent_t=latent_t,
+                    latent_h=latent_h,
+                    latent_w=latent_w,
+                    audio_t=audio_t,
+                    steps=steps,
+                    seed=seed,
+                    progress_callback=progress_callback,
+                )
+            finally:
+                if engine is not None:
+                    del engine
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
     def forward(self, *args, **kwargs):
         raise RuntimeError(
-            "H3 is a streamed joint audio/video model. Use the H3 Sampler "
-            "rather than a generic diffusion MODEL sampler."
+            "H3 is a streamed joint audio/video transformer. Execute it with "
+            "H3 Sampler, which calls the managed transformer's sample() method."
         )
 
 
@@ -289,7 +348,7 @@ class H3ModelLoader:
         # Return a genuine ComfyUI ModelPatcher, not a bare GGUF handle.
         import comfy.model_management
 
-        runtime = H3ModelRuntime(handle)
+        runtime = H3TransformerRuntime(handle)
         patcher = H3ModelPatcher(
             runtime,
             load_device=comfy.model_management.get_torch_device(),
