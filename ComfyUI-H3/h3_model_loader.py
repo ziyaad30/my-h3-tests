@@ -148,7 +148,8 @@ class H3ModelRuntime(torch.nn.Module):
     def __init__(self, handle):
         super().__init__()
         self.handle = handle
-        self.device = torch.device("cpu")
+        # Let ModelPatcher initialize this to its configured offload_device.
+        self.device = None
 
     def get_dtype(self):
         return torch.float32
