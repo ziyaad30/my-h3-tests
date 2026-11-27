@@ -354,6 +354,8 @@ class H3ModelPatcher(ModelPatcherDynamic):
 
     def release_host_tile(self, lease):
         owner = lease["owner"]
+        # Drop our view before HostBuffer truncates the backing allocation.
+        lease["tensor"] = None
         if "pin" in owner._pins.get("weights", {}):
             self.partially_unload_ram(
                 lease["size"], subsets=["weights"]
