@@ -3,15 +3,22 @@
 """
 Standalone MiniMax H3 streamed GGUF linear engine.
 
-Q2_K decoding is vectorized with NumPy.
+Q2_K decoding:
+    - Numba parallel decoder.
+    - Four CPU threads by default, based on measured performance.
+    - Exact output equality with the previous serial decoder.
+    - Independent 256-element blocks decoded in parallel.
 
-Weights remain memory-mapped and are decoded one output-row tile
-at a time. No full transformer matrices or blocks are cached.
+Memory:
+    - GGUF weights remain memory-mapped.
+    - Only one output-row tile is decoded at a time.
+    - No full transformer matrices or blocks are cached.
+    - No pinned-memory staging buffers.
 
 CUDA projections:
     - Activations transferred once per projection.
     - Weight tiles transferred once.
-    - All tokens processed together.
+    - FP32 weights and FP32 matmul retained.
     - Output remains on CUDA.
 
 CPU projections:
@@ -32,7 +39,12 @@ import time
 
 import numpy as np
 import torch
-from numba import njit
+from numba import config, njit, prange, set_num_threads
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 DEFAULT_GGUF = (
     r"C:\Users\User\PycharmProjects\pythonProject"
@@ -50,6 +62,18 @@ Q2K_BLOCK_BYTES = 84
 
 CUDA_MIN_ROW_TILE = 128
 
+# Four threads was the fastest measured setting on the
+# user's 8-logical-processor CPU.
+#
+# This is limited by Numba's configured maximum.
+Q2K_NUM_THREADS = min(4, config.NUMBA_NUM_THREADS)
+
+if Q2K_NUM_THREADS < 1:
+    raise RuntimeError("Numba has no available worker threads")
+
+set_num_threads(Q2K_NUM_THREADS)
+
+
 GGUF_METADATA_FORMATS = {
     0: "<B",
     1: "<b",
@@ -65,6 +89,10 @@ GGUF_METADATA_FORMATS = {
 }
 
 
+# ============================================================
+# GGUF TENSOR DESCRIPTION
+# ============================================================
+
 class Tensor:
     def __init__(self, name, dims, ggml_type, offset):
         self.name = name
@@ -76,22 +104,30 @@ class Tensor:
     @property
     def elements(self):
         result = 1
+
         for dimension in self.dims:
             result *= dimension
+
         return result
 
     @property
     def input_width(self):
         if len(self.dims) != 2:
             raise ValueError(f"{self.name} is not a matrix")
+
         return self.dims[0]
 
     @property
     def output_rows(self):
         if len(self.dims) != 2:
             raise ValueError(f"{self.name} is not a matrix")
+
         return self.dims[1]
 
+
+# ============================================================
+# GGUF READER
+# ============================================================
 
 class GGUF:
     def __init__(self, path):
@@ -124,8 +160,10 @@ class GGUF:
 
     def read(self, n):
         data = self.file.read(n)
+
         if len(data) != n:
             raise EOFError("Unexpected end of GGUF")
+
         return data
 
     def unpack(self, fmt):
@@ -136,8 +174,10 @@ class GGUF:
 
     def string(self):
         n = self.unpack("<Q")
+
         if n > self.size:
             raise ValueError("Invalid GGUF string length")
+
         return self.read(n).decode("utf-8")
 
     def metadata_value(self, kind):
@@ -157,6 +197,7 @@ class GGUF:
             if count > 1_000_000:
                 for _ in range(count):
                     self.metadata_value(element_type)
+
                 return None
 
             return [
@@ -187,6 +228,7 @@ class GGUF:
                 raise ValueError(
                     f"Q2_K element count not divisible by 256: {t.name}"
                 )
+
             return (
                 n // Q2K_BLOCK_ELEMENTS
             ) * Q2K_BLOCK_BYTES
@@ -290,6 +332,7 @@ class GGUF:
                 raise ValueError(
                     f"Invalid Q2_K input width: {name}"
                 )
+
             bytes_per_row = (
                 width // Q2K_BLOCK_ELEMENTS
             ) * Q2K_BLOCK_BYTES
@@ -309,6 +352,7 @@ class GGUF:
             t.absolute_offset
             + first_row * bytes_per_row
         )
+
         end = start + row_count * bytes_per_row
 
         return bytes(self.mm[start:end])
@@ -402,25 +446,30 @@ def decode_q2k_reference(raw):
             dst += 16
 
     if dst != 256 or scale_index != 16:
-        raise RuntimeError("Q2_K reference decoder layout error")
+        raise RuntimeError(
+            "Q2_K reference decoder layout error"
+        )
 
     return result.reshape(-1)
 
 
 # ============================================================
-# VECTORIZED Q2_K DECODER
+# PARALLEL Q2_K NUMBA DECODER
 # ============================================================
 
-@njit(cache=True)
+@njit(cache=True, parallel=True)
 def _decode_q2k_numba_kernel(blocks, d, dmin):
     block_count = blocks.shape[0]
 
     output = np.empty(
         block_count * 256,
-        dtype=np.float32
+        dtype=np.float32,
     )
 
-    for b in range(block_count):
+    # Each iteration writes to a separate 256-element output
+    # region. No two workers write to the same output elements.
+    for b in prange(block_count):
+
         for a in range(2):
             for g in range(4):
                 shift = g * 2
@@ -455,7 +504,7 @@ def _decode_q2k_numba_kernel(blocks, d, dmin):
                     for k in range(16):
                         packed = blocks[
                             b,
-                            quant_start + k
+                            quant_start + k,
                         ]
 
                         q = np.float32(
@@ -475,41 +524,61 @@ def _decode_q2k_numba_kernel(blocks, d, dmin):
 
 def decode_q2k(raw):
     """
-    Numba-compiled Q2_K decoder.
-    Accepts bytes, bytearray, memoryview or NumPy arrays.
+    Parallel Numba Q2_K decoder.
+
+    Accepts:
+        bytes
+        bytearray
+        memoryview
+        NumPy arrays
+
+    Returns:
+        Flat float32 NumPy array.
+
+    Uses the configured Q2K_NUM_THREADS worker threads.
     """
 
     if isinstance(raw, (bytes, bytearray, memoryview)):
-        raw = np.frombuffer(raw, dtype=np.uint8)
-    else:
-        raw = np.asarray(raw, dtype=np.uint8).reshape(-1)
+        raw = np.frombuffer(
+            raw,
+            dtype=np.uint8,
+        )
 
-    if raw.size % 84 != 0:
+    else:
+        raw = np.asarray(
+            raw,
+            dtype=np.uint8,
+        ).reshape(-1)
+
+    if raw.size % Q2K_BLOCK_BYTES:
         raise ValueError(
             f"Invalid Q2_K data size: {raw.size} bytes; "
             "expected a multiple of 84."
         )
 
-    block_count = raw.size // 84
+    block_count = raw.size // Q2K_BLOCK_BYTES
 
     blocks = np.ascontiguousarray(
-        raw.reshape(block_count, 84)
+        raw.reshape(
+            block_count,
+            Q2K_BLOCK_BYTES,
+        )
     )
 
     d = np.frombuffer(
         blocks[:, 80:82].copy().tobytes(),
-        dtype=np.float16
+        dtype=np.float16,
     ).astype(np.float32)
 
     dmin = np.frombuffer(
         blocks[:, 82:84].copy().tobytes(),
-        dtype=np.float16
+        dtype=np.float16,
     ).astype(np.float32)
 
     return _decode_q2k_numba_kernel(
         blocks,
         d,
-        dmin
+        dmin,
     )
 
 
@@ -518,6 +587,7 @@ def decode_q2k(raw):
 # ============================================================
 
 def decode_weight_tile(raw, ggml_type, row_count, input_width):
+
     if ggml_type == TYPE_Q2_K:
         return decode_q2k(raw).reshape(
             row_count,
@@ -555,7 +625,9 @@ def decode_weight_tile(raw, ggml_type, row_count, input_width):
             input_width,
         )
 
-    raise ValueError(f"Unsupported type {ggml_type}")
+    raise ValueError(
+        f"Unsupported type {ggml_type}"
+    )
 
 
 # ============================================================
@@ -563,6 +635,7 @@ def decode_weight_tile(raw, ggml_type, row_count, input_width):
 # ============================================================
 
 class TiledGGUFLinear:
+
     def __init__(
         self,
         gguf,
@@ -571,6 +644,7 @@ class TiledGGUFLinear:
         row_tile=8,
         token_tile=16,
     ):
+
         if tensor_name not in gguf.tensors:
             raise KeyError(
                 f"GGUF tensor not found: {tensor_name}"
@@ -603,10 +677,14 @@ class TiledGGUFLinear:
         self.token_tile = int(token_tile)
 
         if self.requested_row_tile < 1:
-            raise ValueError("row_tile must be positive")
+            raise ValueError(
+                "row_tile must be positive"
+            )
 
         if self.token_tile < 1:
-            raise ValueError("token_tile must be positive")
+            raise ValueError(
+                "token_tile must be positive"
+            )
 
         if (
             self.ggml_type == TYPE_Q2_K
@@ -617,13 +695,17 @@ class TiledGGUFLinear:
             )
 
         self.row_tile = (
-            max(self.requested_row_tile, CUDA_MIN_ROW_TILE)
+            max(
+                self.requested_row_tile,
+                CUDA_MIN_ROW_TILE,
+            )
             if self.device.type == "cuda"
             else self.requested_row_tile
         )
 
     @torch.inference_mode()
     def __call__(self, x):
+
         if not isinstance(x, torch.Tensor):
             x = torch.as_tensor(
                 x,
@@ -666,6 +748,7 @@ class TiledGGUFLinear:
             self.output_rows,
             self.row_tile,
         ):
+
             rows = min(
                 self.row_tile,
                 self.output_rows - row_start,
@@ -727,29 +810,66 @@ DEFAULT_TENSORS = [
 
 
 def main():
+
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--gguf", default=DEFAULT_GGUF)
-    parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--rows", type=int, default=8)
-    parser.add_argument("--tokens", type=int, default=27)
-    parser.add_argument("--row-tile", type=int, default=8)
-    parser.add_argument("--token-tile", type=int, default=2)
-    parser.add_argument("--tensor", action="append", default=None)
+    parser.add_argument(
+        "--gguf",
+        default=DEFAULT_GGUF,
+    )
+
+    parser.add_argument(
+        "--device",
+        default="cuda:0",
+    )
+
+    parser.add_argument(
+        "--rows",
+        type=int,
+        default=8,
+    )
+
+    parser.add_argument(
+        "--tokens",
+        type=int,
+        default=27,
+    )
+
+    parser.add_argument(
+        "--row-tile",
+        type=int,
+        default=8,
+    )
+
+    parser.add_argument(
+        "--token-tile",
+        type=int,
+        default=2,
+    )
+
+    parser.add_argument(
+        "--tensor",
+        action="append",
+        default=None,
+    )
 
     args = parser.parse_args()
 
     print("=" * 60)
-    print("H3 VECTORIZED Q2_K STREAMED LINEAR")
+    print("H3 PARALLEL Q2_K STREAMED LINEAR")
     print("=" * 60)
+
     print(f"Checkpoint: {args.gguf}")
     print(f"Device:     {args.device}")
     print(f"Tokens:     {args.tokens}")
+    print(f"Q2_K CPU threads: {Q2K_NUM_THREADS}")
 
     with GGUF(args.gguf) as gguf:
+
         passed = 0
 
         for name in args.tensor or DEFAULT_TENSORS:
+
             if name not in gguf.tensors:
                 print(f"SKIP missing: {name}")
                 continue
@@ -782,6 +902,7 @@ def main():
                 torch.cuda.reset_peak_memory_stats()
 
             start = time.perf_counter()
+
             y = linear(x)
 
             if linear.device.type == "cuda":
