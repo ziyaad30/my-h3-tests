@@ -138,8 +138,8 @@ def _encode(prompt, qwen_path, projection_path, unload_after_encode):
 
     llm, is_temporary = _get_encoder(qwen_path, unload_after_encode, Llama)
     try:
-        # Reset KV state so each execution encodes only its own prompt.
-        llm.reset()
+        # Match the standalone production path: do not reset a newly-created
+        # llama.cpp context before its first evaluation.
         tokens = llm.tokenize(prompt.encode("utf-8"), add_bos=True)
         if not tokens or len(tokens) > 512:
             raise ValueError(
@@ -177,6 +177,11 @@ def _encode(prompt, qwen_path, projection_path, unload_after_encode):
             .reshape(token_count.value, embedding_width.value)
             .copy()
         )
+
+        # In persistent mode, clear the evaluated sequence only after the
+        # layer output has been copied out of llama.cpp's internal buffer.
+        if not is_temporary:
+            llm.reset()
 
         normalized = (hidden - mean_in) / std_in
         conditioning = (normalized @ matrix) * std_out + mean_out
