@@ -971,6 +971,235 @@ def run_packed_h3_forward(
     return video_prediction, audio_prediction
 
 
+@torch.inference_mode()
+def run_packed_sampler(
+    prompt,
+    width,
+    height,
+    frames,
+    steps,
+    seed=12345,
+):
+    require(torch.cuda.is_available(), "CUDA is unavailable")
+    require(steps >= 1, "At least one sampling step is required")
+    require(width > 0 and height > 0, "Invalid resolution")
+    require(
+        width % 32 == 0 and height % 32 == 0,
+        "Width and height must be multiples of 32",
+    )
+    require(
+        frames >= 5 and (frames - 5) % 17 == 0,
+        "H3 frame count must be 5 + 17*n",
+    )
+
+    latent_t = (
+        2 if frames <= 5
+        else ((frames - 5) // 17) * 5 + 2
+    )
+    latent_h = height // 16
+    latent_w = width // 16
+    audio_t = round(frames / 24.0 * 40.0)
+
+    require(
+        latent_h % 2 == 0 and latent_w % 2 == 0,
+        "Latent dimensions must be divisible by two",
+    )
+
+    device = torch.device("cuda:0")
+
+    # Both schedules are generated from the same unshifted base grid,
+    # but each modality has its own flow shift.
+    base_sigmas = [
+        k / steps
+        for k in range(steps, -1, -1)
+    ]
+
+    video_sigmas = [
+        time_shift_sigma(
+            sigma,
+            1.0,
+            SIGMA_SHIFT_VIDEO,
+        )
+        for sigma in base_sigmas
+    ]
+
+    audio_sigmas = [
+        time_shift_sigma(
+            sigma,
+            1.0,
+            SIGMA_SHIFT_AUDIO,
+        )
+        for sigma in base_sigmas
+    ]
+
+    require(
+        abs(video_sigmas[0] - 1.0) < 1e-6
+        and abs(audio_sigmas[0] - 1.0) < 1e-6
+        and abs(video_sigmas[-1]) < 1e-6
+        and abs(audio_sigmas[-1]) < 1e-6,
+        "Invalid shifted sigma schedules",
+    )
+
+    print("\n========== H3 JOINT AUDIO/VIDEO SAMPLER ==========")
+    print("GPU:", torch.cuda.get_device_name(device))
+    print("Resolution:", f"{width}x{height}")
+    print("Frames:", frames)
+    print("Video latent:", (1, 24, latent_t, latent_h, latent_w))
+    print("Audio latent:", (1, 32, 2, audio_t))
+    print("Steps:", steps)
+    print("Video shift:", SIGMA_SHIFT_VIDEO)
+    print("Audio shift:", SIGMA_SHIFT_AUDIO)
+    print("Video sigmas:", [round(x, 7) for x in video_sigmas])
+    print("Audio sigmas:", [round(x, 7) for x in audio_sigmas])
+    print("Seed:", seed)
+
+    # Text conditioning is calculated once, not once per denoising step.
+    text_states = extract_qwen_conditioning(prompt)
+
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+
+    generator = torch.Generator(device=device).manual_seed(seed)
+
+    video_latent = torch.randn(
+        (1, 24, latent_t, latent_h, latent_w),
+        generator=generator,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    audio_latent = torch.randn(
+        (1, 32, 2, audio_t),
+        generator=generator,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    start_time = time.perf_counter()
+
+    with GGUFFile(GGUF_PATH) as gguf:
+        for index in range(steps):
+            sigma_video = video_sigmas[index]
+            sigma_video_next = video_sigmas[index + 1]
+
+            sigma_audio = audio_sigmas[index]
+            sigma_audio_next = audio_sigmas[index + 1]
+
+            # Confirm that the forward pass's audio-sigma mapping
+            # agrees with the independently constructed audio schedule.
+            mapped_audio_sigma = time_shift_sigma(
+                sigma_video,
+                SIGMA_SHIFT_VIDEO,
+                SIGMA_SHIFT_AUDIO,
+            )
+
+            require(
+                abs(mapped_audio_sigma - sigma_audio) < 1e-6,
+                (
+                    "Video/audio sigma schedules disagree: "
+                    f"{mapped_audio_sigma} vs {sigma_audio}"
+                ),
+            )
+
+            print(
+                f"\n========== STEP {index + 1}/{steps} =========="
+            )
+            print(
+                f"Video sigma: {sigma_video:.8f} -> "
+                f"{sigma_video_next:.8f}"
+            )
+            print(
+                f"Audio sigma: {sigma_audio:.8f} -> "
+                f"{sigma_audio_next:.8f}"
+            )
+
+            video_prediction, audio_prediction = (
+                run_packed_h3_forward(
+                    gguf=gguf,
+                    text_states=text_states,
+                    video_latent=video_latent,
+                    audio_latent=audio_latent,
+                    sigma_video=sigma_video,
+                    device=device,
+                )
+            )
+
+            # The forward function returns the negative output-head
+            # predictions, matching the official CONST/flow convention.
+            dt_video = sigma_video_next - sigma_video
+            dt_audio = sigma_audio_next - sigma_audio
+
+            video_next = (
+                video_latent + dt_video * video_prediction
+            )
+            audio_next = (
+                audio_latent + dt_audio * audio_prediction
+            )
+
+            require(
+                bool(torch.isfinite(video_next).all().item()),
+                f"Video latent became non-finite at step {index + 1}",
+            )
+            require(
+                bool(torch.isfinite(audio_next).all().item()),
+                f"Audio latent became non-finite at step {index + 1}",
+            )
+
+            video_latent = video_next
+            audio_latent = audio_next
+
+            print_stats("Updated video latent", video_latent)
+            print_stats("Updated audio latent", audio_latent)
+
+            del (
+                video_prediction,
+                audio_prediction,
+                video_next,
+                audio_next,
+            )
+            gc.collect()
+
+    torch.cuda.synchronize(device)
+    elapsed = time.perf_counter() - start_time
+
+    output_dir = Path("h3_sampler_output")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    output_path = output_dir / "h3_sample_latents.pt"
+
+    torch.save(
+        {
+            "video_latent": video_latent.detach().cpu(),
+            "audio_latent": audio_latent.detach().cpu(),
+            "seed": seed,
+            "steps": steps,
+            "width": width,
+            "height": height,
+            "frames": frames,
+            "video_shift": SIGMA_SHIFT_VIDEO,
+            "audio_shift": SIGMA_SHIFT_AUDIO,
+            "video_sigmas": video_sigmas,
+            "audio_sigmas": audio_sigmas,
+        },
+        output_path,
+    )
+
+    print("\n========== SAMPLER COMPLETE ==========")
+    print_stats("Final video latent", video_latent)
+    print_stats("Final audio latent", audio_latent)
+    print("Saved:", output_path.resolve())
+    print(f"Elapsed: {elapsed:.2f} seconds")
+    print(
+        "Peak allocated:",
+        f"{torch.cuda.max_memory_allocated(device) / 1024**2:.2f} MiB",
+    )
+    print(
+        "Peak reserved:",
+        f"{torch.cuda.max_memory_reserved(device) / 1024**2:.2f} MiB",
+    )
+    print("No VAE decoding was performed.")
+
+
 def run_packed_test(
         prompt,
         width,
@@ -1157,6 +1386,12 @@ def main():
         help="Run one joint audio/video forward pass through all 50 blocks",
     )
 
+    modes.add_argument(
+        "--sample-test",
+        action="store_true",
+        help="Run joint audio/video Euler sampling",
+    )
+
     parser.add_argument(
         "--tokens",
         type=int,
@@ -1197,6 +1432,19 @@ def main():
         "--frames",
         type=int,
         default=5,
+    )
+
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=2,
+        help="Number of Euler steps (default: 2)",
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=12345,
     )
 
     args = parser.parse_args()
@@ -1242,6 +1490,19 @@ def main():
             height=args.height,
             frames=args.frames,
             sigma=args.sigma,
+        )
+
+    elif args.sample_test:
+        if args.steps < 1 or args.steps > 100:
+            parser.error("--steps must be between 1 and 100")
+
+        run_packed_sampler(
+            prompt=args.prompt,
+            width=args.width,
+            height=args.height,
+            frames=args.frames,
+            steps=args.steps,
+            seed=args.seed,
         )
 
 
