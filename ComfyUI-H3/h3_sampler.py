@@ -158,8 +158,10 @@ class H3Sampler:
         finally:
             # This also runs when ComfyUI raises its native interruption
             # exception, ensuring the active block/engine references are freed.
-            if engine is not None:
-                del engine
-            gc.collect()
-            torch.cuda.empty_cache()
-            handle.execution_lock.release()
+            try:
+                if engine is not None:
+                    del engine
+                gc.collect()
+                torch.cuda.empty_cache()
+            finally:
+                handle.execution_lock.release()
