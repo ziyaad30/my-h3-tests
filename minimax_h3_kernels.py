@@ -257,6 +257,21 @@ class GGUFFile:
             self.file.close()
             self.file = None
 
+    def remap(self):
+        """Release and recreate the read-only GGUF mapping."""
+        if self.file is None:
+            raise RuntimeError("Cannot remap a closed GGUF file")
+
+        if self.mm is not None:
+            self.mm.close()
+            self.mm = None
+
+        self.mm = mmap.mmap(
+            self.file.fileno(),
+            0,
+            access=mmap.ACCESS_READ,
+        )
+
     def __enter__(self):
         return self
 

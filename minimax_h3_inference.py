@@ -877,6 +877,8 @@ def run_packed_h3_forward(
 
         del block
 
+        gguf.remap()
+
         print_process_memory(
             f"block {block_index + 1} after del block"
         )
