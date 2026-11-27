@@ -1,9 +1,8 @@
-"""MiniMax H3 transformer checkpoint loader.
+"""MiniMax H3 streamed checkpoint loader and ComfyUI ModelPatcher bridge.
 
-This is intentionally a checkpoint-reader stage, not yet a ComfyUI ModelPatcher.
-It memory-maps the H3 GGUF and validates its architecture without materializing
-the transformer weights. ModelPatcher integration belongs in the subsequent
-H3 model implementation once its streamed block modules are patchable.
+The checkpoint remains memory-mapped; transformer weights are streamed from
+GGUF row tiles by the H3 inference engine instead of being loaded as a full
+torch module.
 """
 
 import os
