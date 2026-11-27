@@ -1174,8 +1174,8 @@ def parse_args():
     )
     parser.add_argument("--first-image", type=Path, default=None)
     parser.add_argument("--last-image", type=Path, default=None)
-    parser.add_argument("--width", type=int, default=320)
-    parser.add_argument("--height", type=int, default=320)
+    parser.add_argument("--width", type=int, default=480)
+    parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--frames", type=int, default=22)
     parser.add_argument("--steps", type=int, default=None,
                         help="Denoising evaluations; defaults to 4 with Turbo LoRA, otherwise 7")
@@ -1183,7 +1183,7 @@ def parse_args():
                         help="Official MiniMax H3 FL2VA 4-step v1.2 Turbo LoRA safetensors")
     parser.add_argument("--lora-scale", type=float, default=1.0,
                         help="Turbo LoRA strength multiplier (default: 1.0)")
-    parser.add_argument("--seed", type=int, default=12345)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=Path, default=Path("h3_output"))
     parser.add_argument("--decoder-checkpoint", type=Path, default=Path("C:/Users/User/PycharmProjects/pythonProject/models/vae/lightvae-lite-h3-decoder.safetensors"))
     parser.add_argument("--fps", type=float, default=24.0)
@@ -1218,11 +1218,12 @@ def main():
         require(args.lora.name == "minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors",
                 "Only the official FL2VA 4-step v1.2 768p Turbo adapter is supported by this integration")
         lora = H3TurboLoRA(args.lora, strength=args.lora_scale)
-        video_shift = 6.0
-        if args.steps is None:
-            args.steps = 4
-        require(args.steps == 4,
-                "This Turbo LoRA is distilled for exactly 4 denoising evaluations")
+        # Let user set this even with LoRA
+        video_shift = VIDEO_SHIFT  
+        # if args.steps is None:
+        #     args.steps = 4
+        # require(args.steps == 4,
+        #         "This Turbo LoRA is distilled for exactly 4 denoising evaluations")
     else:
         lora = None
         video_shift = VIDEO_SHIFT
