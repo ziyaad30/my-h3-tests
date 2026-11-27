@@ -1,21 +1,14 @@
 """MiniMax H3 standalone inference entry point."""
 
 import argparse
-
 import ctypes
-
 import gc
-
 import math
-
 import time
-
 from pathlib import Path
 
 import numpy as np
-
 import torch
-
 import torch.nn.functional as F
 
 from minimax_h3_kernels import (
@@ -25,6 +18,7 @@ from minimax_h3_kernels import (
 )
 
 from minimax_h3_transformer import *
+
 
 QWEN_MODEL = Path(
     r"C:\Users\User\PycharmProjects\anotherVideo\lingbot_models"
@@ -38,6 +32,10 @@ CLIP_PROJECTION = Path(
     r"\clip_projections\mmh3-4b-ClipProj-v3.1.safetensors"
 )
 
+
+# ============================================================
+# QWEN -> CLIPPROJ CONDITIONING
+# ============================================================
 
 def extract_qwen_conditioning(prompt):
     from safetensors.torch import load_file
@@ -226,6 +224,10 @@ def extract_qwen_conditioning(prompt):
             torch.cuda.empty_cache()
 
 
+# ============================================================
+# TEXT CONDITIONING TEST
+# ============================================================
+
 def run_text_test(prompt, timestep):
     require(
         torch.cuda.is_available(),
@@ -351,6 +353,10 @@ def run_text_test(prompt, timestep):
         print("\n========== TEXT TEST COMPLETE ==========")
 
 
+# ============================================================
+# ADALN TEST
+# ============================================================
+
 def run_adaln_test():
     require(
         torch.cuda.is_available(),
@@ -426,6 +432,10 @@ def run_adaln_test():
     print("\n========== ADALN TEST COMPLETE ==========")
 
 
+# ============================================================
+# SYNTHETIC BLOCK TEST
+# ============================================================
+
 def run_block_test(tokens, timestep):
     require(
         torch.cuda.is_available(),
@@ -461,10 +471,10 @@ def run_block_test(tokens, timestep):
         ).to(device)
 
         tags = (
-                torch.arange(
-                    tokens,
-                    device=device,
-                ) % MODALITIES
+            torch.arange(
+                tokens,
+                device=device,
+            ) % MODALITIES
         )
 
         positions = torch.zeros(
@@ -528,6 +538,10 @@ def run_block_test(tokens, timestep):
 
     print("\n========== BLOCK TEST COMPLETE ==========")
 
+
+# ============================================================
+# PROCESS MEMORY REPORTING
+# ============================================================
 
 def print_process_memory(label):
     import ctypes
@@ -603,14 +617,19 @@ def print_process_memory(label):
         flush=True,
     )
 
+
+# ============================================================
+# PACKED H3 FORWARD
+# ============================================================
+
 @torch.inference_mode()
 def run_packed_h3_forward(
-        gguf,
-        text_states,
-        video_latent,
-        audio_latent,
-        sigma_video,
-        device,
+    gguf,
+    text_states,
+    video_latent,
+    audio_latent,
+    sigma_video,
+    device,
 ):
     print("\n========== H3 PACKED FORWARD ==========")
 
@@ -632,6 +651,12 @@ def run_packed_h3_forward(
         f"Invalid text conditioning shape: {tuple(text_states.shape)}",
     )
 
+    require(
+        math.isfinite(float(sigma_video))
+        and 0.0 < float(sigma_video) <= 1.0,
+        f"Invalid video sigma: {sigma_video}",
+    )
+
     latent_t = video_latent.shape[2]
     latent_h = video_latent.shape[3]
     latent_w = video_latent.shape[4]
@@ -643,6 +668,26 @@ def run_packed_h3_forward(
     print("Video latent:", tuple(video_latent.shape))
     print("Audio latent:", tuple(audio_latent.shape))
     print("Video sigma:", sigma_video)
+
+    # --------------------------------------------------------
+    # Official H3 audio carry parameterization
+    # --------------------------------------------------------
+
+    audio_scale_factor = (
+        SIGMA_SHIFT_VIDEO / SIGMA_SHIFT_AUDIO
+    )
+
+    sigma_audio = time_shift_sigma(
+        sigma_video,
+        SIGMA_SHIFT_VIDEO,
+        SIGMA_SHIFT_AUDIO,
+    )
+
+    audio_carry = sigma_audio / sigma_video
+
+    print("Audio sigma:", sigma_audio)
+    print("Audio carry:", audio_carry)
+    print("Audio scale:", audio_scale_factor)
 
     # --------------------------------------------------------
     # Timesteps
@@ -739,14 +784,20 @@ def run_packed_h3_forward(
         )
     )
 
-    print("Packing audio...")
+    print("\nConverting and packing carried audio...")
+
+    # audio_latent is the sampler's carried audio variable.
+    # Convert it back to native audio coordinates for the model.
+    audio_native = audio_latent * audio_carry
 
     audio_rows = pack_audio(
-        audio_latent.to(
+        audio_native.to(
             device=device,
             dtype=torch.float32,
         )
     )
+
+    del audio_native
 
     require(
         video_rows.shape[0] == video_end - video_start,
@@ -944,7 +995,7 @@ def run_packed_h3_forward(
         audio_timestep_index, 0
     ]
 
-    audio_scale = final_modulation[
+    audio_modulation_scale = final_modulation[
         audio_timestep_index, 1
     ]
 
@@ -958,8 +1009,8 @@ def run_packed_h3_forward(
     )
 
     video_hidden = (
-            video_hidden * (1.0 + video_scale)
-            + video_shift
+        video_hidden * (1.0 + video_scale)
+        + video_shift
     )
 
     video_linear = StreamedLinear(
@@ -1007,8 +1058,8 @@ def run_packed_h3_forward(
     )
 
     audio_hidden = (
-            audio_hidden * (1.0 + audio_scale)
-            + audio_shift
+        audio_hidden * (1.0 + audio_modulation_scale)
+        + audio_shift
     )
 
     audio_linear = StreamedLinear(
@@ -1029,14 +1080,35 @@ def run_packed_h3_forward(
         f"Unexpected audio output width: {audio_prediction_rows.shape[1]}",
     )
 
+    # Native model output-head prediction.
     audio_prediction_rows = -audio_prediction_rows
 
     audio_prediction = unpack_audio(
         audio_prediction_rows
     )
 
+    # --------------------------------------------------------
+    # Official ModelSamplingAV output conversion
+    # --------------------------------------------------------
+
+    # The model was evaluated with:
+    #     audio_native = audio_latent * audio_carry
+    #
+    # Convert the native model output into the derivative of the
+    # carried audio variable with respect to video sigma.
+    audio_prediction = (
+        (1.0 - audio_scale_factor)
+        * (audio_latent * audio_carry)
+        +
+        (
+            1.0
+            + (audio_scale_factor - 1.0) * sigma_audio
+        )
+        * audio_prediction
+    )
+
     print_stats(
-        "Audio prediction",
+        "Carried audio derivative",
         audio_prediction,
     )
 
@@ -1047,13 +1119,17 @@ def run_packed_h3_forward(
 
     require(
         bool(torch.isfinite(audio_prediction).all().item()),
-        "Audio prediction contains NaN/Inf",
+        "Carried audio derivative contains NaN/Inf",
     )
 
     print("\n========== PACKED FORWARD COMPLETE ==========")
 
     return video_prediction, audio_prediction
 
+
+# ============================================================
+# JOINT AUDIO/VIDEO SAMPLER
+# ============================================================
 
 @torch.inference_mode()
 def run_packed_sampler(
@@ -1064,13 +1140,26 @@ def run_packed_sampler(
     steps,
     seed=12345,
 ):
-    require(torch.cuda.is_available(), "CUDA is unavailable")
-    require(steps >= 1, "At least one sampling step is required")
-    require(width > 0 and height > 0, "Invalid resolution")
+    require(
+        torch.cuda.is_available(),
+        "CUDA is unavailable",
+    )
+
+    require(
+        steps >= 1,
+        "At least one sampling step is required",
+    )
+
+    require(
+        width > 0 and height > 0,
+        "Invalid resolution",
+    )
+
     require(
         width % 32 == 0 and height % 32 == 0,
         "Width and height must be multiples of 32",
     )
+
     require(
         frames >= 5 and (frames - 5) % 17 == 0,
         "H3 frame count must be 5 + 17*n",
@@ -1080,9 +1169,13 @@ def run_packed_sampler(
         2 if frames <= 5
         else ((frames - 5) // 17) * 5 + 2
     )
+
     latent_h = height // 16
     latent_w = width // 16
-    audio_t = round(frames / 24.0 * 40.0)
+
+    audio_t = round(
+        frames / 24.0 * 40.0
+    )
 
     require(
         latent_h % 2 == 0 and latent_w % 2 == 0,
@@ -1091,8 +1184,10 @@ def run_packed_sampler(
 
     device = torch.device("cuda:0")
 
-    # Both schedules are generated from the same unshifted base grid,
-    # but each modality has its own flow shift.
+    # --------------------------------------------------------
+    # Official H3 video sigma schedule
+    # --------------------------------------------------------
+
     base_sigmas = [
         k / steps
         for k in range(steps, -1, -1)
@@ -1107,44 +1202,68 @@ def run_packed_sampler(
         for sigma in base_sigmas
     ]
 
-    audio_sigmas = [
-        time_shift_sigma(
-            sigma,
-            1.0,
-            SIGMA_SHIFT_AUDIO,
-        )
-        for sigma in base_sigmas
-    ]
+    # Official H3 ModelSamplingAV audio scale.
+    audio_scale_factor = (
+        SIGMA_SHIFT_VIDEO / SIGMA_SHIFT_AUDIO
+    )
 
     require(
         abs(video_sigmas[0] - 1.0) < 1e-6
-        and abs(audio_sigmas[0] - 1.0) < 1e-6
-        and abs(video_sigmas[-1]) < 1e-6
-        and abs(audio_sigmas[-1]) < 1e-6,
-        "Invalid shifted sigma schedules",
+        and abs(video_sigmas[-1]) < 1e-6,
+        "Invalid video sigma schedule",
     )
+
+    # Audio sigma is derived from the video sigma at each step.
+    audio_sigmas = [
+        time_shift_sigma(
+            sigma,
+            SIGMA_SHIFT_VIDEO,
+            SIGMA_SHIFT_AUDIO,
+        )
+        for sigma in video_sigmas
+    ]
 
     print("\n========== H3 JOINT AUDIO/VIDEO SAMPLER ==========")
     print("GPU:", torch.cuda.get_device_name(device))
     print("Resolution:", f"{width}x{height}")
     print("Frames:", frames)
-    print("Video latent:", (1, 24, latent_t, latent_h, latent_w))
-    print("Audio latent:", (1, 32, 2, audio_t))
+    print(
+        "Video latent:",
+        (1, 24, latent_t, latent_h, latent_w),
+    )
+    print(
+        "Audio latent:",
+        (1, 32, 2, audio_t),
+    )
     print("Steps:", steps)
     print("Video shift:", SIGMA_SHIFT_VIDEO)
     print("Audio shift:", SIGMA_SHIFT_AUDIO)
-    print("Video sigmas:", [round(x, 7) for x in video_sigmas])
-    print("Audio sigmas:", [round(x, 7) for x in audio_sigmas])
+    print("Audio scale:", audio_scale_factor)
+    print(
+        "Video sigmas:",
+        [round(x, 7) for x in video_sigmas],
+    )
+    print(
+        "Derived audio sigmas:",
+        [round(x, 7) for x in audio_sigmas],
+    )
     print("Seed:", seed)
 
-    # Text conditioning is calculated once, not once per denoising step.
+    # --------------------------------------------------------
+    # Text conditioning
+    # --------------------------------------------------------
+
     text_states = extract_qwen_conditioning(prompt)
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(device)
 
-    generator = torch.Generator(device=device).manual_seed(seed)
+    generator = torch.Generator(
+        device=device
+    ).manual_seed(seed)
 
+    # Both sampler states start as Gaussian noise.
+    # Audio remains in carried coordinates throughout sampling.
     video_latent = torch.randn(
         (1, 24, latent_t, latent_h, latent_w),
         generator=generator,
@@ -1161,6 +1280,10 @@ def run_packed_sampler(
 
     start_time = time.perf_counter()
 
+    # --------------------------------------------------------
+    # Denoising loop
+    # --------------------------------------------------------
+
     with GGUFFile(GGUF_PATH) as gguf:
         for index in range(steps):
             sigma_video = video_sigmas[index]
@@ -1169,8 +1292,7 @@ def run_packed_sampler(
             sigma_audio = audio_sigmas[index]
             sigma_audio_next = audio_sigmas[index + 1]
 
-            # Confirm that the forward pass's audio-sigma mapping
-            # agrees with the independently constructed audio schedule.
+            # Verify the native audio sigma mapping.
             mapped_audio_sigma = time_shift_sigma(
                 sigma_video,
                 SIGMA_SHIFT_VIDEO,
@@ -1180,18 +1302,34 @@ def run_packed_sampler(
             require(
                 abs(mapped_audio_sigma - sigma_audio) < 1e-6,
                 (
-                    "Video/audio sigma schedules disagree: "
+                    "Video/audio sigma mapping mismatch: "
                     f"{mapped_audio_sigma} vs {sigma_audio}"
+                ),
+            )
+
+            mapped_audio_sigma_next = time_shift_sigma(
+                sigma_video_next,
+                SIGMA_SHIFT_VIDEO,
+                SIGMA_SHIFT_AUDIO,
+            )
+
+            require(
+                abs(mapped_audio_sigma_next - sigma_audio_next) < 1e-6,
+                (
+                    "Next video/audio sigma mapping mismatch: "
+                    f"{mapped_audio_sigma_next} vs {sigma_audio_next}"
                 ),
             )
 
             print(
                 f"\n========== STEP {index + 1}/{steps} =========="
             )
+
             print(
                 f"Video sigma: {sigma_video:.8f} -> "
                 f"{sigma_video_next:.8f}"
             )
+
             print(
                 f"Audio sigma: {sigma_audio:.8f} -> "
                 f"{sigma_audio_next:.8f}"
@@ -1208,22 +1346,28 @@ def run_packed_sampler(
                 )
             )
 
-            # The forward function returns the negative output-head
-            # predictions, matching the official CONST/flow convention.
-            dt_video = sigma_video_next - sigma_video
-            dt_audio = sigma_audio_next - sigma_audio
+            # Both sampler states advance on the video-sigma
+            # coordinate. The audio prediction has already been
+            # converted to the carried-variable derivative.
+            dt_video = (
+                sigma_video_next - sigma_video
+            )
 
             video_next = (
-                video_latent + dt_video * video_prediction
+                video_latent
+                + dt_video * video_prediction
             )
+
             audio_next = (
-                audio_latent + dt_audio * audio_prediction
+                audio_latent
+                + dt_video * audio_prediction
             )
 
             require(
                 bool(torch.isfinite(video_next).all().item()),
                 f"Video latent became non-finite at step {index + 1}",
             )
+
             require(
                 bool(torch.isfinite(audio_next).all().item()),
                 f"Audio latent became non-finite at step {index + 1}",
@@ -1232,8 +1376,15 @@ def run_packed_sampler(
             video_latent = video_next
             audio_latent = audio_next
 
-            print_stats("Updated video latent", video_latent)
-            print_stats("Updated audio latent", audio_latent)
+            print_stats(
+                "Updated video latent",
+                video_latent,
+            )
+
+            print_stats(
+                "Updated carried audio latent",
+                audio_latent,
+            )
 
             del (
                 video_prediction,
@@ -1241,13 +1392,22 @@ def run_packed_sampler(
                 video_next,
                 audio_next,
             )
+
             gc.collect()
 
     torch.cuda.synchronize(device)
+
     elapsed = time.perf_counter() - start_time
 
+    # --------------------------------------------------------
+    # Save output
+    # --------------------------------------------------------
+
     output_dir = Path("h3_sampler_output")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     output_path = output_dir / "h3_sample_latents.pt"
 
@@ -1262,6 +1422,10 @@ def run_packed_sampler(
             "frames": frames,
             "video_shift": SIGMA_SHIFT_VIDEO,
             "audio_shift": SIGMA_SHIFT_AUDIO,
+            "audio_scale": audio_scale_factor,
+            "audio_parameterization": (
+                "official_h3_model_sampling_av_carried"
+            ),
             "video_sigmas": video_sigmas,
             "audio_sigmas": audio_sigmas,
         },
@@ -1269,27 +1433,43 @@ def run_packed_sampler(
     )
 
     print("\n========== SAMPLER COMPLETE ==========")
-    print_stats("Final video latent", video_latent)
-    print_stats("Final audio latent", audio_latent)
+
+    print_stats(
+        "Final video latent",
+        video_latent,
+    )
+
+    print_stats(
+        "Final carried audio latent",
+        audio_latent,
+    )
+
     print("Saved:", output_path.resolve())
     print(f"Elapsed: {elapsed:.2f} seconds")
+
     print(
         "Peak allocated:",
         f"{torch.cuda.max_memory_allocated(device) / 1024**2:.2f} MiB",
     )
+
     print(
         "Peak reserved:",
         f"{torch.cuda.max_memory_reserved(device) / 1024**2:.2f} MiB",
     )
+
     print("No VAE decoding was performed.")
 
 
+# ============================================================
+# ONE-PASS PACKED TEST
+# ============================================================
+
 def run_packed_test(
-        prompt,
-        width,
-        height,
-        frames,
-        sigma,
+    prompt,
+    width,
+    height,
+    frames,
+    sigma,
 ):
     require(
         torch.cuda.is_available(),
@@ -1333,6 +1513,12 @@ def run_packed_test(
     require(
         audio_t > 0,
         "Invalid audio latent temporal length",
+    )
+
+    require(
+        math.isfinite(float(sigma))
+        and 0.0 < float(sigma) <= 1.0,
+        f"Invalid sigma: {sigma}",
     )
 
     device = torch.device("cuda:0")
@@ -1437,6 +1623,10 @@ def run_packed_test(
     print("\n========== PACKED TEST COMPLETE ==========")
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
     parser = argparse.ArgumentParser(
         description="Standalone streamed MiniMax H3 inference"
@@ -1497,7 +1687,10 @@ def main():
     parser.add_argument(
         "--prompt",
         type=str,
-        default="A cinematic shot of a red car driving through a rainy city at night.",
+        default=(
+            "A cinematic shot of a red car driving "
+            "through a rainy city at night."
+        ),
     )
 
     parser.add_argument(
@@ -1534,16 +1727,16 @@ def main():
     args = parser.parse_args()
 
     if (
-            not math.isfinite(args.timestep)
-            or not 0.0 <= args.timestep <= 1.0
+        not math.isfinite(args.timestep)
+        or not 0.0 <= args.timestep <= 1.0
     ):
         parser.error(
             "--timestep must be finite and in [0,1]"
         )
 
     if (
-            not math.isfinite(args.sigma)
-            or not 0.0 < args.sigma <= 1.0
+        not math.isfinite(args.sigma)
+        or not 0.0 < args.sigma <= 1.0
     ):
         parser.error(
             "--sigma must be finite and in (0,1]"
