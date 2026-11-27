@@ -831,7 +831,6 @@ class TiledGGUFLinear:
             raw_bytes = 0
             host_weight_bytes = 0
             vram_weight_bytes = 0
-            host_tile_lease = None
 
             try:
                 raw = self.gguf.read_tensor_rows(
@@ -856,32 +855,17 @@ class TiledGGUFLinear:
                         f"Non-finite weight values in {self.name}"
                     )
 
-                # In ComfyUI, stage every decoded weight tile (CPU and CUDA
-                # projections) through the dynamic ModelPatcher's managed
-                # HostBuffer pool. Standalone inference keeps its normal path.
-                patcher = getattr(self.gguf, "comfy_model_patcher", None)
-                if patcher is not None:
-                    host_tile_lease = patcher.stage_host_tile(weight_np)
-                    if self.device.type == "cuda":
-                        weight = host_tile_lease["tensor"].to(
-                            device=self.device,
-                            dtype=torch.float32,
-                        )
-                    else:
-                        weight = host_tile_lease["tensor"]
-                    # The decoded NumPy copy has now been transferred into
-                    # ComfyUI's managed pinned HostBuffer; release it promptly.
-                    del weight_np
-                    weight_np = None
-                    self.gguf.memory_stats.remove_host(host_weight_bytes)
-                    host_weight_bytes = 0
-                else:
-                    weight = torch.from_numpy(
-                        np.ascontiguousarray(weight_np)
-                    ).to(
-                        device=self.device,
-                        dtype=torch.float32,
-                    )
+                # Keep the streamed tile in its decoded CPU buffer for CPU
+                # projections. For CUDA projections, transfer only this tile.
+                # Do not pin each tile: ComfyUI's dynamic ModelPatcher manages
+                # model residency, while these short-lived buffers are bounded
+                # scratch space and are accounted by StreamMemoryStats.
+                weight = torch.from_numpy(
+                    np.ascontiguousarray(weight_np)
+                ).to(
+                    device=self.device,
+                    dtype=torch.float32,
+                )
 
                 if weight.device.type == "cuda":
                     vram_weight_bytes = weight.numel() * weight.element_size()
@@ -899,8 +883,6 @@ class TiledGGUFLinear:
                 # HostBuffer backing allocation.
                 if weight is not None:
                     del weight
-                if host_tile_lease is not None:
-                    patcher.release_host_tile(host_tile_lease)
                 if vram_weight_bytes:
                     self.gguf.memory_stats.remove_vram(vram_weight_bytes)
                 if host_weight_bytes:
