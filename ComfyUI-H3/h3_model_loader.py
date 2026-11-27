@@ -92,9 +92,9 @@ class H3ModelPatcher(ModelPatcher):
         return self.model
 
     def detach(self, unpatch_all=True):
-        self.model.device = self.offload_device
-        self.model.model_loaded_weight_memory = 0
-        return self.model
+        # Preserve ComfyUI's eject/callback lifecycle while our overridden
+        # unpatch_model/model_patches_to prevent any recursive tensor moves.
+        return super().detach(unpatch_all=unpatch_all)
 
     def current_loaded_device(self):
         return self.model.device
