@@ -1,7 +1,22 @@
 """ComfyUI node for streamed joint MiniMax H3 audio/video sampling."""
 import gc
+
 import torch
-from .h3_engine import H3InferenceEngine, sample as run_h3_sampling, validate_checkpoint
+
+from .h3_engine import (
+    NUM_BLOCKS,
+    H3InferenceEngine,
+    sample as run_h3_sampling,
+    validate_checkpoint,
+)
+
+
+def _check_interrupted():
+    """Raise ComfyUI's native interruption exception when Cancel is requested."""
+    import comfy.model_management
+
+    comfy.model_management.throw_exception_if_processing_interrupted()
+
 
 class H3Sampler:
     @classmethod
@@ -37,6 +52,13 @@ class H3Sampler:
         if steps < 1:
             raise ValueError("At least one denoising evaluation is required.")
 
+        # Import inside execution so this module remains importable by static
+        # tooling without initializing ComfyUI's runtime.
+        from comfy.utils import ProgressBar
+
+        total_blocks = steps * NUM_BLOCKS
+        progress = ProgressBar(total_blocks)
+
         # H3Conditioning wraps the unprojected ClipProj tensor in standard ComfyUI CONDITIONING.
         if not isinstance(conditioning, (list, tuple)) or not conditioning:
             raise TypeError("Expected non-empty ComfyUI CONDITIONING from H3 Conditioning.")
@@ -61,25 +83,59 @@ class H3Sampler:
         if audio_t <= 0:
             raise ValueError("Invalid H3 audio latent temporal length.")
 
-        gguf = model.gguf
-        validate_checkpoint(gguf)
-        print(f"[H3 Sampler] {width}x{height}, {frames} frames, {steps} evaluations, seed={seed}", flush=True)
-        engine = H3InferenceEngine(
-            gguf=gguf, text_states=text_states, keyframes=[],
-            latent_t=latent_t, latent_h=latent_h, latent_w=latent_w,
-            audio_t=audio_t, seed=seed, lora=None,
-        )
-        del text_states
-        gc.collect()
-        video_latent, audio_latent, elapsed, _, _ = run_h3_sampling(
-            engine=engine, latent_t=latent_t, latent_h=latent_h, latent_w=latent_w,
-            audio_t=audio_t, steps=steps, seed=seed,
-        )
-        del engine
-        gc.collect()
-        torch.cuda.empty_cache()
-        print(f"[H3 Sampler] Joint audio/video sampling completed in {elapsed:.2f}s.", flush=True)
-        return (
-            video_latent.detach().to(device="cpu", dtype=torch.float32).contiguous(),
-            audio_latent.detach().to(device="cpu", dtype=torch.float32).contiguous(),
-        )
+        def update_progress(completed, total):
+            # Update first so the UI reflects the just-finished block, then
+            # raise ComfyUI's own interruption exception if Cancel was pressed.
+            progress.update_absolute(completed, total)
+            _check_interrupted()
+
+        engine = None
+        try:
+            _check_interrupted()
+            gguf = model.gguf
+            validate_checkpoint(gguf)
+            print(
+                f"[H3 Sampler] {width}x{height}, {frames} frames, "
+                f"{steps} evaluations, seed={seed}",
+                flush=True,
+            )
+            engine = H3InferenceEngine(
+                gguf=gguf,
+                text_states=text_states,
+                keyframes=[],
+                latent_t=latent_t,
+                latent_h=latent_h,
+                latent_w=latent_w,
+                audio_t=audio_t,
+                seed=seed,
+                lora=None,
+            )
+            del text_states
+            gc.collect()
+            _check_interrupted()
+
+            video_latent, audio_latent, elapsed, _, _ = run_h3_sampling(
+                engine=engine,
+                latent_t=latent_t,
+                latent_h=latent_h,
+                latent_w=latent_w,
+                audio_t=audio_t,
+                steps=steps,
+                seed=seed,
+                progress_callback=update_progress,
+            )
+            print(
+                f"[H3 Sampler] Joint audio/video sampling completed in {elapsed:.2f}s.",
+                flush=True,
+            )
+            return (
+                video_latent.detach().to(device="cpu", dtype=torch.float32).contiguous(),
+                audio_latent.detach().to(device="cpu", dtype=torch.float32).contiguous(),
+            )
+        finally:
+            # This also runs when ComfyUI raises its native interruption
+            # exception, ensuring the active block/engine references are freed.
+            if engine is not None:
+                del engine
+            gc.collect()
+            torch.cuda.empty_cache()

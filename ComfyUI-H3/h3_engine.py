@@ -641,6 +641,7 @@ class H3InferenceEngine:
         sigma_audio: float,
         step_index: int,
         total_steps: int,
+        progress_callback=None,
     ):
         require(tuple(video_latent.shape) == (
             1, 24, self.latent_t, self.latent_h, self.latent_w
@@ -735,6 +736,18 @@ class H3InferenceEngine:
 
             del block, modulation_table, adaln_indices
             torch.cuda.synchronize()
+
+            # Report each completed transformer block to ComfyUI. The node's
+            # callback also checks the global interrupt flag, so Cancel is
+            # honoured at the next block boundary rather than after all 50.
+            if progress_callback is not None:
+                completed_blocks = (
+                    (step_index - 1) * NUM_BLOCKS + block_index + 1
+                )
+                progress_callback(
+                    completed_blocks,
+                    total_steps * NUM_BLOCKS,
+                )
 
             if block_index == 0 or (block_index + 1) % 5 == 0:
                 print(
@@ -844,6 +857,7 @@ def sample(
     steps: int,
     seed: int,
     video_shift: float = VIDEO_SHIFT,
+    progress_callback=None,
 ):
     video_scheduler = H3FlowScheduler(shift=video_shift)
     audio_scheduler = H3FlowScheduler(shift=AUDIO_SHIFT)
@@ -912,6 +926,7 @@ def sample(
             sigma_audio=sigma_audio,
             step_index=index + 1,
             total_steps=steps,
+            progress_callback=progress_callback,
         )
 
         video_latent = video_scheduler.step(
