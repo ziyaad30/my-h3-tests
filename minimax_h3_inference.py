@@ -529,6 +529,80 @@ def run_block_test(tokens, timestep):
     print("\n========== BLOCK TEST COMPLETE ==========")
 
 
+def print_process_memory(label):
+    import ctypes
+    import ctypes.wintypes as wt
+
+    SIZE_T = ctypes.c_size_t
+
+    class PROCESS_MEMORY_COUNTERS_EX(ctypes.Structure):
+        _fields_ = [
+            ("cb", wt.DWORD),
+            ("PageFaultCount", wt.DWORD),
+            ("PeakWorkingSetSize", SIZE_T),
+            ("WorkingSetSize", SIZE_T),
+            ("QuotaPeakPagedPoolUsage", SIZE_T),
+            ("QuotaPagedPoolUsage", SIZE_T),
+            ("QuotaPeakNonPagedPoolUsage", SIZE_T),
+            ("QuotaNonPagedPoolUsage", SIZE_T),
+            ("PagefileUsage", SIZE_T),
+            ("PeakPagefileUsage", SIZE_T),
+            ("PrivateUsage", SIZE_T),
+        ]
+
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", wt.DWORD),
+            ("dwMemoryLoad", wt.DWORD),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    counters = PROCESS_MEMORY_COUNTERS_EX()
+    counters.cb = ctypes.sizeof(counters)
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+
+    kernel32.GetCurrentProcess.restype = wt.HANDLE
+
+    get_memory = psapi.GetProcessMemoryInfo
+    get_memory.argtypes = [
+        wt.HANDLE,
+        ctypes.POINTER(PROCESS_MEMORY_COUNTERS_EX),
+        wt.DWORD,
+    ]
+    get_memory.restype = wt.BOOL
+
+    if not get_memory(
+        kernel32.GetCurrentProcess(),
+        ctypes.byref(counters),
+        counters.cb,
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    system = MEMORYSTATUSEX()
+    system.dwLength = ctypes.sizeof(system)
+
+    if not kernel32.GlobalMemoryStatusEx(ctypes.byref(system)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    gib = 1024 ** 3
+
+    print(
+        f"[RAM] {label:<32} "
+        f"WorkingSet={counters.WorkingSetSize / gib:.2f} GiB | "
+        f"Private={counters.PrivateUsage / gib:.2f} GiB | "
+        f"Pagefile={counters.PagefileUsage / gib:.2f} GiB | "
+        f"SystemAvailable={system.ullAvailPhys / gib:.2f} GiB",
+        flush=True,
+    )
+
 @torch.inference_mode()
 def run_packed_h3_forward(
         gguf,
@@ -803,6 +877,10 @@ def run_packed_h3_forward(
 
         del block
 
+        print_process_memory(
+            f"block {block_index + 1} after del block"
+        )
+
         if torch.cuda.is_available():
             torch.cuda.synchronize(device)
 
@@ -819,6 +897,10 @@ def run_packed_h3_forward(
 
         if block_index % 5 == 4:
             gc.collect()
+
+            print_process_memory(
+                f"block {block_index + 1} after gc.collect"
+            )
 
     transformer_elapsed = time.perf_counter() - start_time
 
