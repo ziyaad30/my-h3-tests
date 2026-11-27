@@ -865,8 +865,12 @@ class H3InferenceEngine:
         video_rows = patchify_video(video_latent)
         audio_rows = pack_audio(audio_latent)
 
+        print_stats("Audio latent entering", audio_latent)
+        print_stats("Audio packed rows", audio_rows)
+
         video_embed = self.video_projection(video_rows)
         audio_embed = self.audio_projection(audio_rows)
+        print_stats("Audio patch embedding", audio_embed)
 
         hidden = torch.empty(
             self.layout["seq_len"],
@@ -952,6 +956,12 @@ class H3InferenceEngine:
                     flush=True,
                 )
 
+            if block_index in (0, 4, 9, 24, 49):
+                print_stats(
+                    f"Audio hidden after B{block_index + 1}",
+                    hidden[audio_start:audio_end],
+                )
+
             if (block_index + 1) % 5 == 0:
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -980,12 +990,17 @@ class H3InferenceEngine:
         )
 
         target_hidden = hidden[audio_start:video_end]
+        print_stats(
+            "Audio hidden before head",
+            target_hidden[:self.layout["audio_count"]],
+        )
         video_all, audio_all = self.output_heads(
             target_hidden,
             selected_final_modulation,
         )
 
         audio_count = self.layout["audio_count"]
+        print_stats("Audio output head raw", audio_all[:audio_count])
         audio_prediction_rows = audio_all[:audio_count]
         video_prediction_rows = video_all[audio_count:]
 
@@ -1003,6 +1018,7 @@ class H3InferenceEngine:
             self.latent_w // 2,
         )
         audio_prediction = unpack_audio(audio_prediction_rows)
+        print_stats("Audio prediction", audio_prediction)
 
         # H3OutputHeads returns the positive data-ward head values.
         # ComfyUI negates these before CONST.calculate_denoised (x - sigma*v).
@@ -1079,6 +1095,8 @@ def sample(
     print("Video shift:", video_shift)
     print("Audio shift:", AUDIO_SHIFT)
     print("Seed:", seed)
+    print_stats("Initial video noise", video_latent)
+    print_stats("Initial audio noise", audio_latent)
 
     start_time = time.perf_counter()
 
@@ -1120,6 +1138,8 @@ def sample(
             audio_scheduler.timesteps[index],
             audio_latent,
         ).prev_sample
+
+        print_stats("Audio latent after step", audio_latent)
 
         require(bool(torch.isfinite(video_latent).all().item()),
                 f"Video latent became non-finite at step {index + 1}")
