@@ -220,6 +220,16 @@ class H3TransformerRuntime(torch.nn.Module):
         )
 
 
+class _H3HostTileOwner:
+    """Ephemeral owner record required by ComfyUI's pinned-memory API."""
+
+    def __init__(self, pin_state):
+        self._pin_state = pin_state
+        self._pins = {}
+        self.weight = None
+        self.bias = None
+
+
 class H3ModelPatcher(ModelPatcherDynamic):
     """ComfyUI-managed lifecycle wrapper for the streamed H3 runtime."""
 
@@ -271,36 +281,90 @@ class H3ModelPatcher(ModelPatcherDynamic):
         return None
 
     def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
-        # Called by ComfyUI's LoadedModel.model_use_more_vram() during
-        # load_models_gpu(). The manager reserves model_size() before sampling;
-        # H3 then accounts the transient tile through loaded_size().
+        # Use ComfyUI's actual dynamic loader. Besides registering the patcher
+        # with the dynamic manager, this initializes its VBAR and managed
+        # HostBuffer pools. The runtime has no torch Parameters, so its dynamic
+        # module scan stages no model weights; H3 supplies tiles on demand.
         with self.handle.execution_lock:
             if self.handle.closed or self.handle.gguf is None:
                 raise RuntimeError("Cannot activate a closed H3 checkpoint.")
-            self.model.device = torch.device(device_to)
+            super().partially_load(
+                device_to,
+                extra_memory=extra_memory,
+                force_patch_weights=force_patch_weights,
+            )
             self.model.dynamic_pins[self.load_device]["active"] = True
         return 0
 
     def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
-        # H3 tiles are short-lived and released by TiledGGUFLinear's finally
-        # blocks. They cannot be evicted independently while a projection is
-        # executing; ComfyUI can unload the patcher between executions.
+        # Delegate VBAR/back-up eviction to ComfyUI's dynamic patcher.
         with self.handle.execution_lock:
-            self.model.device = torch.device(device_to)
-            self.model.dynamic_pins[self.load_device]["active"] = False
-        return 0
+            return super().partially_unload(
+                device_to,
+                memory_to_free=memory_to_free,
+                force_patch_weights=force_patch_weights,
+            )
 
     def partially_unload_ram(self, ram_to_unload, subsets=None):
-        # H3 does not pin or cache GGUF pages in ComfyUI HostBuffers. Raw and
-        # decoded host tiles are lexical temporaries and are released by the
-        # projection after each tile. There is therefore no persistent H3
-        # host allocation for ComfyUI's pin-eviction API to evict.
-        return 0
+        # Use ComfyUI's pin eviction implementation for H3's HostBuffer tiles.
+        if subsets is None:
+            freed = super().partially_unload_ram(ram_to_unload)
+        else:
+            freed = super().partially_unload_ram(ram_to_unload, subsets=subsets)
+        if freed and self.handle.gguf is not None:
+            self.handle.gguf.memory_stats.remove_host(freed)
+        return freed
+
+    def stage_host_tile(self, values):
+        # Allocate decoded FP32 tiles through ComfyUI's pinned HostBuffer
+        # manager so RAM pressure and pin eviction use the native APIs.
+        import comfy.pinned_memory
+
+        pin_state = self.model.dynamic_pins[self.load_device]
+        if not pin_state["hostbufs_initialized"]:
+            raise RuntimeError(
+                "H3 HostBuffers are not initialized. H3 ModelPatcher must be "
+                "loaded by comfy.model_management.load_models_gpu() first."
+            )
+
+        owner = _H3HostTileOwner(pin_state)
+        size = int(values.nbytes)
+        allocated = comfy.pinned_memory.pin_memory(
+            owner, subset="weights", size=size
+        )
+        pin = comfy.pinned_memory.get_pin(owner, subset="weights")
+        if not allocated or pin is None:
+            raise RuntimeError(
+                "ComfyUI could not allocate a managed pinned host tile for H3. "
+                "Check ComfyUI pinned-memory limits and available system RAM."
+            )
+
+        self.handle.gguf.memory_stats.add_host(size)
+        try:
+            target = pin.view(torch.float32).reshape(values.shape)
+            target.copy_(torch.from_numpy(values))
+        except Exception:
+            self.partially_unload_ram(size, subsets=["weights"])
+            raise
+
+        return {"owner": owner, "tensor": target, "size": size}
+
+    def release_host_tile(self, lease):
+        owner = lease["owner"]
+        if "pin" in owner._pins.get("weights", {}):
+            self.partially_unload_ram(
+                lease["size"], subsets=["weights"]
+            )
 
     def unpatch_model(self, device_to=None, unpatch_weights=True):
-        # Never invoke the base implementation: it calls model.to(device).
+        # ModelPatcherDynamic's implementation avoids model.to() on the
+        # runtime, unloads VBAR pages and evicts managed HostBuffer tiles.
         with self.handle.execution_lock:
-            self.model.dynamic_pins[self.load_device]["active"] = False
+            super().unpatch_model(
+                device_to=None, unpatch_weights=unpatch_weights
+            )
+            if unpatch_weights:
+                self.model.dynamic_pins[self.load_device]["active"] = False
             if device_to is not None:
                 self.model.device = torch.device(device_to)
         return self.model
@@ -312,20 +376,26 @@ class H3ModelPatcher(ModelPatcherDynamic):
         load_weights=True,
         force_patch_weights=False,
     ):
-        # There are no full-model weights to patch or transfer.
-        with self.handle.execution_lock:
-            if self.handle.closed or self.handle.gguf is None:
-                raise RuntimeError("Cannot activate a closed H3 checkpoint.")
-            target = self.load_device if device_to is None else device_to
-            self.model.device = torch.device(target)
-        return self.model
+        # Delegate the no-weight patch operation to ComfyUI's dynamic
+        # patcher. The streamed GGUF is never passed through model.to().
+        if load_weights:
+            raise RuntimeError(
+                "H3 weights are streamed; load through load_models_gpu(), "
+                "not ModelPatcher.patch_model()."
+            )
+        return super().patch_model(
+            device_to=device_to,
+            lowvram_model_memory=lowvram_model_memory,
+            load_weights=False,
+            force_patch_weights=force_patch_weights,
+        )
 
     def detach(self, unpatch_all=True):
         # Preserve the mmap for graph reuse when ComfyUI evicts this patcher.
         with self.handle.execution_lock:
             result = super().detach(unpatch_all=unpatch_all)
-            # detach(unpatch_all=False) skips unpatch_model in ComfyUI's base
-            # class, but the runtime must still be marked offloaded.
+            # detach(unpatch_all=False) skips unpatch_model; still mark the
+            # dynamic model inactive and move its logical device to offload.
             self.model.dynamic_pins[self.load_device]["active"] = False
             self.model.device = self.offload_device
             return result
