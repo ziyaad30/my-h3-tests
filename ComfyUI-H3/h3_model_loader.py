@@ -10,7 +10,7 @@ import threading
 
 import torch
 import folder_paths
-from comfy.model_patcher import ModelPatcher
+from comfy.model_patcher import ModelPatcherDynamic
 
 # ---------------------------------------------------------------------------
 # Streamed H3 transformer checkpoint loader
@@ -220,7 +220,7 @@ class H3TransformerRuntime(torch.nn.Module):
         )
 
 
-class H3ModelPatcher(ModelPatcher):
+class H3ModelPatcher(ModelPatcherDynamic):
     """ComfyUI-managed lifecycle wrapper for the streamed H3 runtime."""
 
     def __init__(
@@ -245,9 +245,10 @@ class H3ModelPatcher(ModelPatcher):
     def handle(self):
         return self.model.handle
 
-    # Keep the base ModelPatcher lifecycle. Returning True here would opt into
-    # ComfyUI's separate dynamic-patcher protocol (including prompt-tracker
-    # methods) that this streamed runtime does not implement.
+    # ModelPatcherDynamic supplies ComfyUI's dynamic-model lifecycle,
+    # including prompt tracking and dynamic VRAM/RAM eviction hooks. H3
+    # overrides the weight-loading hooks because its GGUF tiles are streamed
+    # by TiledGGUFLinear rather than represented as torch Parameters.
     def model_size(self):
         # ComfyUI manages the maximum simultaneously resident FP32 weight tile,
         # not the complete disk-backed GGUF checkpoint.
@@ -270,20 +271,36 @@ class H3ModelPatcher(ModelPatcher):
         return None
 
     def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
+        # Called by ComfyUI's LoadedModel.model_use_more_vram() during
+        # load_models_gpu(). The manager reserves model_size() before sampling;
+        # H3 then accounts the transient tile through loaded_size().
         with self.handle.execution_lock:
             if self.handle.closed or self.handle.gguf is None:
                 raise RuntimeError("Cannot activate a closed H3 checkpoint.")
             self.model.device = torch.device(device_to)
+            self.model.dynamic_pins[self.load_device]["active"] = True
         return 0
 
     def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
+        # H3 tiles are short-lived and released by TiledGGUFLinear's finally
+        # blocks. They cannot be evicted independently while a projection is
+        # executing; ComfyUI can unload the patcher between executions.
         with self.handle.execution_lock:
             self.model.device = torch.device(device_to)
+            self.model.dynamic_pins[self.load_device]["active"] = False
+        return 0
+
+    def partially_unload_ram(self, ram_to_unload, subsets=None):
+        # H3 does not pin or cache GGUF pages in ComfyUI HostBuffers. Raw and
+        # decoded host tiles are lexical temporaries and are released by the
+        # projection after each tile. There is therefore no persistent H3
+        # host allocation for ComfyUI's pin-eviction API to evict.
         return 0
 
     def unpatch_model(self, device_to=None, unpatch_weights=True):
         # Never invoke the base implementation: it calls model.to(device).
         with self.handle.execution_lock:
+            self.model.dynamic_pins[self.load_device]["active"] = False
             if device_to is not None:
                 self.model.device = torch.device(device_to)
         return self.model
@@ -309,6 +326,7 @@ class H3ModelPatcher(ModelPatcher):
             result = super().detach(unpatch_all=unpatch_all)
             # detach(unpatch_all=False) skips unpatch_model in ComfyUI's base
             # class, but the runtime must still be marked offloaded.
+            self.model.dynamic_pins[self.load_device]["active"] = False
             self.model.device = self.offload_device
             return result
 
@@ -354,7 +372,8 @@ class H3ModelLoader:
 
         handle = H3ModelHandle(path)
 
-        # Return a genuine ComfyUI ModelPatcher, not a bare GGUF handle.
+        # Return a ComfyUI dynamic ModelPatcher so the prompt tracker and
+        # dynamic model manager use their native lifecycle for this runtime.
         import comfy.model_management
 
         runtime = H3TransformerRuntime(handle)
