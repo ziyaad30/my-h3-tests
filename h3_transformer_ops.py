@@ -811,7 +811,7 @@ class H3TransformerBlock:
             dtype=torch.float32,
         )
 
-        del fc1_cpu, normalized
+        del fc1_cpu
 
         if fc1_output.shape != (
                 token_count,
@@ -822,6 +822,7 @@ class H3TransformerBlock:
             )
         if self.lora is not None:
             self.lora.add_linear("fc1", normalized, fc1_output)
+        del normalized
 
         # ----------------------------------------------------
         # SWIGLU
