@@ -1,4 +1,3 @@
-
 import gc
 import types
 from pathlib import Path
@@ -285,9 +284,8 @@ def decode_video_latents(latents, output_dir, checkpoint=None, fps=24):
     decoder._decode_clip = types.MethodType(streaming_decode_clip, decoder)
 
     print("Retained decoder blocks:", decoder.config["kept_layers"])
-    print("Checkpoint spatial tile size:", decoder.tile_size)
+    print("Spatial tile size:", decoder.tile_size)
     print("Spatial tile overlap:", decoder.tile_overlap)
-    print("Spatial tile selection: automatic from latent resolution")
 
     gc.collect()
     torch.cuda.empty_cache()
