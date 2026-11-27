@@ -4,6 +4,7 @@ import types
 from pathlib import Path
 
 import torch
+from PIL import Image
 
 from lightvae_h3_standalone.lightvae.h3_lightvae_decoder import Decoder
 from lightvae_h3_standalone.lightvae.utils import h3_decoded_frames
@@ -240,6 +241,128 @@ def report_gpu_memory(label):
 # ============================================================
 # MAIN
 # ============================================================
+
+
+
+# ============================================================
+# REUSABLE VIDEO-LATENT DECODING + EXPORT
+# ============================================================
+
+@torch.inference_mode()
+def decode_video_latents(latents, output_dir, checkpoint=None, fps=24):
+    """Decode normalized [1,24,T,H,W] latents and export PNG frames + MP4."""
+    output_dir = Path(output_dir)
+    checkpoint = Path(checkpoint) if checkpoint is not None else CHECKPOINT
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU unavailable.")
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Decoder checkpoint not found: {checkpoint}")
+    if latents.ndim != 5 or latents.shape[0] != 1 or latents.shape[1] != 24:
+        raise ValueError(f"Expected [1,24,T,H,W] video latent, got {tuple(latents.shape)}")
+    if not torch.isfinite(latents).all():
+        raise ValueError("Video latents contain NaN or Inf.")
+    if fps <= 0:
+        raise ValueError(f"FPS must be positive, got {fps}")
+
+    expected_frames = h3_decoded_frames(int(latents.shape[2]))
+    source = ROOT / "lightvae_h3_standalone" / "lightvae" / "h3_lightvae_decoder.py"
+    if not source.is_file():
+        raise FileNotFoundError(f"LightVAE decoder source not found: {source}")
+
+    print("\n========== LIGHTVAE-LITE VIDEO DECODING ==========", flush=True)
+    print("GPU:", torch.cuda.get_device_name(0))
+    print("Decoder checkpoint:", checkpoint)
+    print("Input latent:", tuple(latents.shape))
+    print("Expected decoded frames:", expected_frames)
+    print("Output directory:", output_dir.resolve())
+
+    decoder = Decoder(checkpoint=checkpoint)
+    decoder.eval()
+    decoder.requires_grad_(False)
+    decoder.to(device="cpu", dtype=DTYPE)
+    decoder.decoder.rope.materialize_buffer("cpu")
+    decoder.decoder.forward = types.MethodType(streaming_forward, decoder.decoder)
+    decoder._decode_clip = types.MethodType(streaming_decode_clip, decoder)
+
+    print("Retained decoder blocks:", decoder.config["kept_layers"])
+    print("Spatial tile size:", decoder.tile_size)
+    print("Spatial tile overlap:", decoder.tile_overlap)
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize(DEVICE)
+    torch.cuda.reset_peak_memory_stats(DEVICE)
+
+    print("\nStarting LightVAE-Lite decode...", flush=True)
+    video = decoder(latents.detach().to(device="cpu", dtype=torch.float32))
+    torch.cuda.synchronize(DEVICE)
+
+    expected_shape = (1, 3, expected_frames, int(latents.shape[-2]) * 16, int(latents.shape[-1]) * 16)
+    if tuple(video.shape) != expected_shape:
+        raise RuntimeError(f"Decoded shape {tuple(video.shape)}; expected {expected_shape}")
+    if not torch.isfinite(video).all():
+        raise RuntimeError("Decoded video contains NaN or Inf.")
+
+    print("Decoded video shape:", tuple(video.shape))
+    print("Decoded value range:", float(video.min()), float(video.max()))
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    frames_dir = output_dir / "frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    video_cpu = video[0].detach().float().cpu()
+
+    for frame_index in range(video_cpu.shape[1]):
+        rgb = ((video_cpu[:, frame_index].clamp(-1, 1) + 1) * 127.5).round()
+        rgb = rgb.to(torch.uint8).permute(1, 2, 0).contiguous().numpy()
+        Image.fromarray(rgb, mode="RGB").save(frames_dir / f"frame_{frame_index + 1:04d}.png")
+        print(f"Saved frame {frame_index + 1}/{video_cpu.shape[1]}", flush=True)
+        del rgb
+
+    mp4_path = output_dir / "h3_generated.mp4"
+    mp4_written = False
+    try:
+        import cv2
+        height, width = int(video_cpu.shape[-2]), int(video_cpu.shape[-1])
+        writer = cv2.VideoWriter(str(mp4_path), cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (width, height))
+        if writer.isOpened():
+            for frame_index in range(video_cpu.shape[1]):
+                rgb = ((video_cpu[:, frame_index].clamp(-1, 1) + 1) * 127.5).round()
+                rgb = rgb.to(torch.uint8).permute(1, 2, 0).contiguous().numpy()
+                writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+                del rgb
+            writer.release()
+            mp4_written = mp4_path.is_file() and mp4_path.stat().st_size > 0
+        else:
+            writer.release()
+            print("OpenCV MP4 writer unavailable; trying imageio.")
+    except ImportError:
+        print("OpenCV unavailable; trying imageio.")
+
+    if not mp4_written:
+        try:
+            import imageio.v2 as imageio
+            with imageio.get_writer(str(mp4_path), fps=float(fps), codec="libx264") as writer:
+                for frame_index in range(video_cpu.shape[1]):
+                    rgb = ((video_cpu[:, frame_index].clamp(-1, 1) + 1) * 127.5).round()
+                    rgb = rgb.to(torch.uint8).permute(1, 2, 0).contiguous().numpy()
+                    writer.append_data(rgb)
+                    del rgb
+                mp4_written = mp4_path.is_file() and mp4_path.stat().st_size > 0
+        except ImportError:
+            print("Neither OpenCV nor imageio is installed; PNG frames are available.")
+
+    print("\nLightVAE-Lite decoding complete.")
+    print("PNG frames:", frames_dir.resolve())
+    if mp4_written:
+        print("MP4 video:", mp4_path.resolve())
+    else:
+        print("MP4 was not created; PNG frames were saved.")
+    report_gpu_memory("GPU memory after decoding")
+
+    del video_cpu, video, decoder
+    gc.collect()
+    torch.cuda.empty_cache()
+    return {"frames_dir": frames_dir, "mp4_path": mp4_path if mp4_written else None, "frame_count": expected_frames}
 
 def main():
 
