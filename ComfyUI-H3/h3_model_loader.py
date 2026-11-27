@@ -455,6 +455,7 @@ class H3ModelLoader:
             load_device=comfy.model_management.get_torch_device(),
             offload_device=comfy.model_management.unet_offload_device(),
         )
+        handle.gguf.comfy_model_patcher = patcher
         print(
             f"[H3 Model Loader] Registered streamed MODEL with ComfyUI "
             f"(GGUF mmap: {handle.file_size / (1024 ** 3):.2f} GiB; "
