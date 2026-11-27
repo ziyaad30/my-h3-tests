@@ -237,7 +237,11 @@ class H3ModelPatcher(ModelPatcher):
     def detach(self, unpatch_all=True):
         # Preserve the mmap for graph reuse when ComfyUI evicts this patcher.
         with self.handle.execution_lock:
-            return super().detach(unpatch_all=unpatch_all)
+            result = super().detach(unpatch_all=unpatch_all)
+            # detach(unpatch_all=False) skips unpatch_model in ComfyUI's base
+            # class, but the runtime must still be marked offloaded.
+            self.model.device = self.offload_device
+            return result
 
 
 # Register a dedicated dropdown without changing ComfyUI's normal GGUF lists.
