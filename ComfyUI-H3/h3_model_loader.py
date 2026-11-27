@@ -337,6 +337,8 @@ class H3ModelPatcher(ModelPatcherDynamic):
         )
         pin = comfy.pinned_memory.get_pin(owner, subset="weights")
         if not allocated or pin is None:
+            if "pin" in owner._pins.get("weights", {}):
+                self.partially_unload_ram(size, subsets=["weights"])
             raise RuntimeError(
                 "ComfyUI could not allocate a managed pinned host tile for H3. "
                 "Check ComfyUI pinned-memory limits and available system RAM."
