@@ -7,8 +7,11 @@ H3 model implementation once its streamed block modules are patchable.
 """
 
 import os
+import threading
 
+import torch
 import folder_paths
+from comfy.model_patcher import ModelPatcher
 
 # ---------------------------------------------------------------------------
 # Streamed H3 transformer checkpoint loader
@@ -103,8 +106,10 @@ class H3ModelHandle:
 
     def __init__(self, path):
         self.path = os.path.abspath(path)
+        self.file_size = os.path.getsize(self.path)
         self.gguf = None
         self.closed = False
+        self.execution_lock = threading.RLock()
 
         reader_class = _load_h3_gguf_reader()
         try:
@@ -116,20 +121,124 @@ class H3ModelHandle:
             raise
 
     def close(self):
-        if self.closed:
-            return
-        self.closed = True
-        gguf = self.gguf
-        self.gguf = None
-        if gguf is not None:
-            gguf.close()
-        print("[H3 Model Loader] Checkpoint mapping released.", flush=True)
+        with self.execution_lock:
+            if self.closed:
+                return
+            self.closed = True
+            gguf = self.gguf
+            self.gguf = None
+            if gguf is not None:
+                gguf.close()
+            print("[H3 Model Loader] Checkpoint mapping released.", flush=True)
 
     def __del__(self):
         try:
             self.close()
         except Exception:
             pass
+
+
+class H3ModelRuntime(torch.nn.Module):
+    """Lightweight runtime object owned by ComfyUI's ModelPatcher.
+
+    Transformer weights remain in the read-only GGUF mapping and are streamed
+    by H3InferenceEngine. This module intentionally has no Parameter tensors,
+    so ComfyUI must not move or materialize the checkpoint as a torch model.
+    """
+
+    def __init__(self, handle):
+        super().__init__()
+        self.handle = handle
+        self.device = torch.device("cpu")
+
+    def get_dtype(self):
+        return torch.float32
+
+    def forward(self, *args, **kwargs):
+        raise RuntimeError(
+            "H3 is a streamed joint audio/video model. Use the H3 Sampler "
+            "rather than a generic diffusion MODEL sampler."
+        )
+
+
+class H3ModelPatcher(ModelPatcher):
+    """ComfyUI-managed lifecycle wrapper for the streamed H3 runtime."""
+
+    def __init__(
+        self,
+        model,
+        load_device,
+        offload_device,
+        size=0,
+        weight_inplace_update=False,
+        fast_disk=False,
+    ):
+        super().__init__(
+            model,
+            load_device,
+            offload_device,
+            size=0,
+            weight_inplace_update=weight_inplace_update,
+            fast_disk=fast_disk,
+        )
+
+    @property
+    def handle(self):
+        return self.model.handle
+
+    def model_size(self):
+        # No persistent torch parameters are resident on the GPU.
+        return 0
+
+    def loaded_size(self):
+        # Active row tiles are transient allocations, not resident weights.
+        return 0
+
+    def model_dtype(self):
+        return torch.float32
+
+    def model_patches_to(self, device):
+        # H3 GGUF tensors are not ordinary ModelPatcher weight patches.
+        return None
+
+    def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
+        with self.handle.execution_lock:
+            if self.handle.closed or self.handle.gguf is None:
+                raise RuntimeError("Cannot activate a closed H3 checkpoint.")
+            self.model.device = torch.device(device_to)
+        return 0
+
+    def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
+        with self.handle.execution_lock:
+            self.model.device = torch.device(device_to)
+        return 0
+
+    def unpatch_model(self, device_to=None, unpatch_weights=True):
+        # Never invoke the base implementation: it calls model.to(device).
+        with self.handle.execution_lock:
+            if device_to is not None:
+                self.model.device = torch.device(device_to)
+        return self.model
+
+    def patch_model(
+        self,
+        device_to=None,
+        lowvram_model_memory=0,
+        load_weights=True,
+        force_patch_weights=False,
+    ):
+        # There are no full-model weights to patch or transfer.
+        with self.handle.execution_lock:
+            if self.handle.closed or self.handle.gguf is None:
+                raise RuntimeError("Cannot activate a closed H3 checkpoint.")
+            target = self.load_device if device_to is None else device_to
+            self.model.device = torch.device(target)
+        return self.model
+
+    def detach(self, unpatch_all=True):
+        # Preserve the mmap for graph reuse when ComfyUI evicts this patcher.
+        with self.handle.execution_lock:
+            return super().detach(unpatch_all=unpatch_all)
 
 
 # Register a dedicated dropdown without changing ComfyUI's normal GGUF lists.
@@ -152,7 +261,7 @@ class H3ModelLoader:
             }
         }
 
-    RETURN_TYPES = ("H3_MODEL",)
+    RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "load_model"
     CATEGORY = "MiniMax H3/Model"
@@ -172,4 +281,20 @@ class H3ModelLoader:
             )
 
         handle = H3ModelHandle(path)
-        return (handle,)
+
+        # Return a genuine ComfyUI ModelPatcher, not a bare GGUF handle.
+        import comfy.model_management
+
+        runtime = H3ModelRuntime(handle)
+        patcher = H3ModelPatcher(
+            runtime,
+            load_device=comfy.model_management.get_torch_device(),
+            offload_device=comfy.model_management.unet_offload_device(),
+        )
+        print(
+            f"[H3 Model Loader] Registered streamed MODEL with ComfyUI "
+            f"(GGUF mapping: {handle.file_size / (1024 ** 3):.2f} GiB; "
+            f"persistent GPU parameters: 0).",
+            flush=True,
+        )
+        return (patcher,)
