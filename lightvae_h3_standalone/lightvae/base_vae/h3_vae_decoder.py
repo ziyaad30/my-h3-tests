@@ -317,10 +317,32 @@ class Decoder(H3Module):
         return self.decoder(self.post_quant_conv(latents))
 
     def _decode_spatial(self, latents):
+        # Select the spatial tile size from the actual latent dimensions.
+        # Small outputs use one full-frame tile to avoid spatial stitching
+        # boundaries. Larger outputs retain the checkpoint tile size to keep
+        # decoder attention memory bounded on low-VRAM GPUs.
         height, width = latents.shape[-2:]
-        heights, height_overlaps = split_tiles(height * 16, self.tile_size, self.tile_overlap)
-        widths, width_overlaps = split_tiles(width * 16, self.tile_size, self.tile_overlap)
-        rows = [[self._decode_clip(latents[..., h, w]) for w in widths] for h in heights]
+        decoded_h, decoded_w = height * 16, width * 16
+        tile_size = int(self.tile_size)
+        if max(decoded_h, decoded_w) <= 512:
+            required_tile = ((max(decoded_h, decoded_w) + 31) // 32) * 32
+            tile_size = max(tile_size, required_tile)
+
+        heights, height_overlaps = split_tiles(
+            decoded_h, tile_size, self.tile_overlap
+        )
+        widths, width_overlaps = split_tiles(
+            decoded_w, tile_size, self.tile_overlap
+        )
+        print(
+            f"Spatial decode: {decoded_w}x{decoded_h} | "
+            f"tile={tile_size} | grid={len(heights)}x{len(widths)}",
+            flush=True,
+        )
+        rows = [
+            [self._decode_clip(latents[..., h, w]) for w in widths]
+            for h in heights
+        ]
         return stitch_tiles(rows, height_overlaps, width_overlaps)
 
     def forward(self, latents):
