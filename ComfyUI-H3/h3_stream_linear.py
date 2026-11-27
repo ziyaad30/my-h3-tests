@@ -36,6 +36,7 @@ import argparse
 import mmap
 import os
 import struct
+import threading
 import time
 
 import numpy as np
@@ -128,6 +129,69 @@ class Tensor:
 
 
 # ============================================================
+# STREAMED MEMORY ACCOUNTING
+# ============================================================
+
+class StreamMemoryStats:
+    """Tracks live host staging buffers and live CUDA weight tiles."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.active_vram_bytes = 0
+        self.peak_vram_bytes = 0
+        self.active_host_bytes = 0
+        self.peak_host_bytes = 0
+
+    def add_vram(self, size):
+        size = int(size)
+        if size <= 0:
+            return
+        with self._lock:
+            self.active_vram_bytes += size
+            self.peak_vram_bytes = max(self.peak_vram_bytes, self.active_vram_bytes)
+
+    def remove_vram(self, size):
+        size = int(size)
+        if size <= 0:
+            return
+        with self._lock:
+            self.active_vram_bytes -= size
+            if self.active_vram_bytes < 0:
+                raise RuntimeError("H3 VRAM tile accounting underflow")
+
+    def add_host(self, size):
+        size = int(size)
+        if size <= 0:
+            return
+        with self._lock:
+            self.active_host_bytes += size
+            self.peak_host_bytes = max(self.peak_host_bytes, self.active_host_bytes)
+
+    def remove_host(self, size):
+        size = int(size)
+        if size <= 0:
+            return
+        with self._lock:
+            self.active_host_bytes -= size
+            if self.active_host_bytes < 0:
+                raise RuntimeError("H3 host tile accounting underflow")
+
+    def reset_peaks(self):
+        with self._lock:
+            self.peak_vram_bytes = self.active_vram_bytes
+            self.peak_host_bytes = self.active_host_bytes
+
+    def snapshot(self):
+        with self._lock:
+            return {
+                "active_vram_bytes": self.active_vram_bytes,
+                "peak_vram_bytes": self.peak_vram_bytes,
+                "active_host_bytes": self.active_host_bytes,
+                "peak_host_bytes": self.peak_host_bytes,
+            }
+
+
+# ============================================================
 # GGUF READER
 # ============================================================
 
@@ -143,6 +207,8 @@ class GGUF:
         self.alignment = 32
         self.data_offset = 0
         self.tensors = {}
+        self.memory_stats = StreamMemoryStats()
+        self.stream_working_set_bytes = 0
 
         self.open()
         self.parse()
@@ -314,6 +380,17 @@ class GGUF:
                 raise ValueError(
                     f"Tensor outside file: {t.name}"
                 )
+
+        # ComfyUI manages the maximum simultaneously resident weight tile,
+        # not the complete disk-backed GGUF. The CUDA path enforces 128 rows.
+        for tensor in self.tensors.values():
+            if len(tensor.dims) != 2:
+                continue
+            rows = min(128, tensor.output_rows)
+            tile_bytes = rows * tensor.input_width * 4
+            self.stream_working_set_bytes = max(
+                self.stream_working_set_bytes, tile_bytes
+            )
 
     def read_tensor_rows(self, name, first_row, row_count):
         t = self.tensors[name]
@@ -746,42 +823,67 @@ class TiledGGUFLinear:
                 self.output_rows - row_start,
             )
 
-            raw = self.gguf.read_tensor_rows(
-                self.name,
-                row_start,
-                rows,
-            )
+            raw = None
+            weight_np = None
+            weight = None
+            raw_bytes = 0
+            host_weight_bytes = 0
+            vram_weight_bytes = 0
 
-            weight_np = decode_weight_tile(
-                raw,
-                self.ggml_type,
-                rows,
-                self.input_width,
-            )
+            try:
+                raw = self.gguf.read_tensor_rows(
+                    self.name,
+                    row_start,
+                    rows,
+                )
+                raw_bytes = len(raw)
+                self.gguf.memory_stats.add_host(raw_bytes)
 
-            if not np.isfinite(weight_np).all():
-                raise FloatingPointError(
-                    f"Non-finite weight values in {self.name}"
+                weight_np = decode_weight_tile(
+                    raw,
+                    self.ggml_type,
+                    rows,
+                    self.input_width,
+                )
+                host_weight_bytes = int(weight_np.nbytes)
+                self.gguf.memory_stats.add_host(host_weight_bytes)
+
+                if not np.isfinite(weight_np).all():
+                    raise FloatingPointError(
+                        f"Non-finite weight values in {self.name}"
+                    )
+
+                weight = torch.from_numpy(
+                    np.ascontiguousarray(weight_np)
+                ).to(
+                    device=self.device,
+                    dtype=torch.float32,
                 )
 
-            weight = torch.from_numpy(
-                np.ascontiguousarray(weight_np)
-            ).to(
-                device=self.device,
-                dtype=torch.float32,
-            )
+                if weight.device.type == "cuda":
+                    vram_weight_bytes = weight.numel() * weight.element_size()
+                    self.gguf.memory_stats.add_vram(vram_weight_bytes)
 
-            output[
-                :,
-                row_start:row_start + rows,
-            ] = torch.matmul(
-                activation,
-                weight.T,
-            )
-
-            del raw
-            del weight_np
-            del weight
+                output[
+                    :,
+                    row_start:row_start + rows,
+                ] = torch.matmul(
+                    activation,
+                    weight.T,
+                )
+            finally:
+                if vram_weight_bytes:
+                    self.gguf.memory_stats.remove_vram(vram_weight_bytes)
+                if weight is not None:
+                    del weight
+                if host_weight_bytes:
+                    self.gguf.memory_stats.remove_host(host_weight_bytes)
+                if weight_np is not None:
+                    del weight_np
+                if raw_bytes:
+                    self.gguf.memory_stats.remove_host(raw_bytes)
+                if raw is not None:
+                    del raw
 
         return output
 
