@@ -146,18 +146,57 @@ def _encode(prompt, qwen_path, projection_path, unload_after_encode):
                 f"Prompt must tokenize to 1–512 tokens; got {len(tokens)}."
             )
 
-        llm.eval(tokens)
+        # Temporary diagnostics: report the exact Python/native state around
+        # evaluation and the custom C call without changing the inference path.
+        ctx_object = llm._ctx.ctx
+        try:
+            ctx_address = ctypes.cast(ctx_object, ctypes.c_void_p).value
+        except (TypeError, ctypes.ArgumentError):
+            ctx_address = None
+
+        native_fn = binding.llama_get_layer_output
+        print("\\n[H3 DEBUG] ---- Qwen layer-output diagnostics ----", flush=True)
+        print(f"[H3 DEBUG] model_path={qwen_path!r}", flush=True)
+        print(f"[H3 DEBUG] llama_object_type={type(llm)!r}", flush=True)
+        print(f"[H3 DEBUG] context_object_type={type(ctx_object)!r}", flush=True)
+        print(f"[H3 DEBUG] context_object={ctx_object!r}", flush=True)
+        print(f"[H3 DEBUG] context_address={ctx_address!r}", flush=True)
+        print(f"[H3 DEBUG] token_count={len(tokens)}", flush=True)
+        print(f"[H3 DEBUG] token_head={tokens[:8]!r}", flush=True)
+        print(f"[H3 DEBUG] native_function={native_fn!r}", flush=True)
+        print(f"[H3 DEBUG] native_argtypes={getattr(native_fn, 'argtypes', '<missing>')!r}", flush=True)
+        print(f"[H3 DEBUG] native_restype={getattr(native_fn, 'restype', '<missing>')!r}", flush=True)
+
+        print("[H3 DEBUG] calling llm.eval(tokens)...", flush=True)
+        eval_result = llm.eval(tokens)
+        print(f"[H3 DEBUG] llm.eval completed; return={eval_result!r}", flush=True)
 
         token_count = ctypes.c_int32(0)
         embedding_width = ctypes.c_int32(0)
-        pointer = binding.llama_get_layer_output(
-            llm._ctx.ctx,
+        print("[H3 DEBUG] calling llama_get_layer_output...", flush=True)
+        pointer = native_fn(
+            ctx_object,
             ctypes.byref(token_count),
             ctypes.byref(embedding_width),
         )
 
+        try:
+            pointer_address = ctypes.cast(pointer, ctypes.c_void_p).value
+        except (TypeError, ctypes.ArgumentError):
+            pointer_address = None
+
+        print(f"[H3 DEBUG] returned_pointer_type={type(pointer)!r}", flush=True)
+        print(f"[H3 DEBUG] returned_pointer={pointer!r}", flush=True)
+        print(f"[H3 DEBUG] returned_pointer_address={pointer_address!r}", flush=True)
+        print(f"[H3 DEBUG] returned_token_count={token_count.value}", flush=True)
+        print(f"[H3 DEBUG] returned_embedding_width={embedding_width.value}", flush=True)
+        print("[H3 DEBUG] ------------------------------------------\\n", flush=True)
+
         if not pointer:
-            raise RuntimeError("llama_get_layer_output returned NULL.")
+            raise RuntimeError(
+                "llama_get_layer_output returned NULL. See the preceding "
+                "[H3 DEBUG] diagnostics in the ComfyUI console."
+            )
         if token_count.value != len(tokens):
             raise RuntimeError(
                 f"Qwen token mismatch: {token_count.value} vs {len(tokens)}."
