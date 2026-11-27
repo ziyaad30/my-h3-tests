@@ -148,6 +148,25 @@ class H3Transformer(torch.nn.Module):
     def __init__(self, handle):
         super().__init__()
         self.handle = handle
+        from .h3_engine import (
+            NUM_BLOCKS, CUDA_ROW_TILE, TOKEN_TILE, QUERY_CHUNK, KEY_CHUNK,
+        )
+        from .h3_transformer_ops import H3TransformerBlock
+
+        # Register the complete block graph with ComfyUI. Quantized matrices
+        # remain mmap-backed and are still decoded a row tile at a time.
+        self.blocks = torch.nn.ModuleList([
+            H3TransformerBlock(
+                handle.gguf,
+                block_index=index,
+                device="cuda:0",
+                row_tile=CUDA_ROW_TILE,
+                token_tile=TOKEN_TILE,
+                query_chunk=QUERY_CHUNK,
+                key_chunk=KEY_CHUNK,
+            )
+            for index in range(NUM_BLOCKS)
+        ])
         self.working_set_bytes = int(handle.gguf.stream_working_set_bytes)
         # Let ModelPatcher initialize this to its configured offload_device.
         self.device = None
@@ -196,6 +215,7 @@ class H3Transformer(torch.nn.Module):
                     audio_t=audio_t,
                     seed=seed,
                     lora=lora,
+                    transformer_blocks=self.blocks,
                 )
                 return run_h3_sampling(
                     engine=engine,
