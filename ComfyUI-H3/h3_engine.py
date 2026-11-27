@@ -27,6 +27,7 @@ NUM_BLOCKS = 50
 
 VIDEO_SHIFT = 12.0
 AUDIO_SHIFT = 3.0
+DEFAULT_FPS = 24.0
 VISUAL_COND_TIMESTEP = 0.999
 
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
@@ -229,10 +230,13 @@ def frame_grid(latent_h: int, latent_w: int):
     return coordinates, w_axis
 
 
-def video_time_grid(latent_t: int, origin: float) -> torch.Tensor:
+def video_time_grid(latent_t: int, origin: float, fps: float = DEFAULT_FPS) -> torch.Tensor:
+    if not math.isfinite(float(fps)) or fps <= 0:
+        raise ValueError(f"fps must be a positive finite number, got {fps}")
+    temporal_scale = DEFAULT_FPS / float(fps)
     spans = torch.tensor(
         [
-            FRAME_RESCALE * FRAME_PER_TOKEN[index % len(FRAME_PER_TOKEN)]
+            FRAME_RESCALE * FRAME_PER_TOKEN[index % len(FRAME_PER_TOKEN)] * temporal_scale
             for index in range(latent_t)
         ],
         dtype=torch.float64,
@@ -242,11 +246,11 @@ def video_time_grid(latent_t: int, origin: float) -> torch.Tensor:
     )
 
 
-def video_grid(latent_t: int, frame_coordinates: torch.Tensor, origin: float):
+def video_grid(latent_t: int, frame_coordinates: torch.Tensor, origin: float, fps: float = DEFAULT_FPS):
     result = torch.empty(
         latent_t, frame_coordinates.shape[0], 3, dtype=torch.float64
     )
-    result[:, :, 0] = video_time_grid(latent_t, origin)[:, None]
+    result[:, :, 0] = video_time_grid(latent_t, origin, fps)[:, None]
     result[:, :, 1:] = frame_coordinates[None]
     return result.reshape(-1, 3)
 
@@ -271,6 +275,7 @@ def build_packed_layout(
     latent_w: int,
     audio_t: int,
     keyframes: list[dict],
+    fps: float = DEFAULT_FPS,
 ) -> dict:
     frame_coordinates, width_axis = frame_grid(latent_h, latent_w)
     frame_rows = frame_coordinates.shape[0]
@@ -302,7 +307,7 @@ def build_packed_layout(
             video_grid(
                 latent.shape[2],
                 frame_coordinates,
-                origin + FRAME_RESCALE * frame_index,
+                origin + FRAME_RESCALE * frame_index * (DEFAULT_FPS / float(fps)),
             )
         )
         row = end
@@ -324,7 +329,7 @@ def build_packed_layout(
     video_count = latent_t * frame_rows
     video_end = video_start + video_count
     segments.append((video_start, video_end, "video"))
-    positions.append(video_grid(latent_t, frame_coordinates, origin))
+    positions.append(video_grid(latent_t, frame_coordinates, origin, fps))
     row = video_end
 
     position_ids = torch.cat(positions, dim=0)
@@ -445,6 +450,7 @@ class H3InferenceEngine:
         seed: int,
         lora: H3TurboLoRA | None = None,
         transformer_blocks: torch.nn.ModuleList | None = None,
+        fps: float = DEFAULT_FPS,
     ):
         self.gguf = gguf
         if transformer_blocks is None or len(transformer_blocks) != NUM_BLOCKS:
@@ -467,6 +473,7 @@ class H3InferenceEngine:
             latent_w=latent_w,
             audio_t=audio_t,
             keyframes=keyframes,
+            fps=fps,
         )
 
         self.position_ids = self.layout["position_ids"]
@@ -862,10 +869,11 @@ def sample(
     steps: int,
     seed: int,
     video_shift: float = VIDEO_SHIFT,
+    audio_shift: float = AUDIO_SHIFT,
     progress_callback=None,
 ):
     video_scheduler = H3FlowScheduler(shift=video_shift)
-    audio_scheduler = H3FlowScheduler(shift=AUDIO_SHIFT)
+    audio_scheduler = H3FlowScheduler(shift=audio_shift)
 
     # set_timesteps receives sigma points, so steps+1 points produce
     # exactly the requested number of model evaluations.
@@ -899,7 +907,7 @@ def sample(
     print("Transformer blocks per evaluation:", NUM_BLOCKS)
     print("Total transformer block executions:", steps * NUM_BLOCKS)
     print("Video shift:", video_shift)
-    print("Audio shift:", AUDIO_SHIFT)
+    print("Audio shift:", audio_shift)
     print("Seed:", seed)
     print_stats("Initial video noise", video_latent)
     print_stats("Initial audio noise", audio_latent)
@@ -911,7 +919,7 @@ def sample(
         sigma_audio = float(audio_scheduler.sigmas[index].item())
 
         mapped_audio_sigma = time_shift_sigma(
-            sigma_video, video_shift, AUDIO_SHIFT
+            sigma_video, video_shift, audio_shift
         )
         require(
             abs(mapped_audio_sigma - sigma_audio) < 1e-6,
