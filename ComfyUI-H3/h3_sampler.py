@@ -23,7 +23,7 @@ class H3Sampler:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model": ("H3_MODEL",),
+                "model": ("MODEL",),
                 "conditioning": ("CONDITIONING",),
                 "width": ("INT", {"default": 480, "min": 32, "max": 4096, "step": 32}),
                 "height": ("INT", {"default": 256, "min": 32, "max": 4096, "step": 32}),
@@ -43,8 +43,13 @@ class H3Sampler:
     def sample(self, model, conditioning, width, height, frames, steps, seed):
         if not torch.cuda.is_available():
             raise RuntimeError("H3 sampling requires CUDA; no CUDA device is available.")
-        if getattr(model, "closed", True) or getattr(model, "gguf", None) is None:
-            raise RuntimeError("H3 model handle is closed or has no mapped GGUF checkpoint.")
+        from comfy.model_patcher import ModelPatcher
+        if not isinstance(model, ModelPatcher):
+            raise TypeError("H3 Sampler expects the MODEL output from H3 Model Loader.")
+        runtime = getattr(model, "model", None)
+        handle = getattr(runtime, "handle", None)
+        if handle is None or handle.closed or handle.gguf is None:
+            raise RuntimeError("H3 ModelPatcher is closed or has no mapped GGUF checkpoint.")
         if width <= 0 or height <= 0 or width % 32 or height % 32:
             raise ValueError("H3 width and height must be positive multiples of 32.")
         if frames < 5 or (frames - 5) % 17:
@@ -90,9 +95,16 @@ class H3Sampler:
             _check_interrupted()
 
         engine = None
+        handle.execution_lock.acquire()
         try:
             _check_interrupted()
-            gguf = model.gguf
+
+            # Register with ComfyUI's model manager before allocating inference
+            # tensors. H3 has no persistent GPU weights; row tiles stream per block.
+            import comfy.model_management
+            comfy.model_management.load_models_gpu([model], memory_required=0)
+
+            gguf = handle.gguf
             validate_checkpoint(gguf)
             print(
                 f"[H3 Sampler] {width}x{height}, {frames} frames, "
@@ -150,3 +162,4 @@ class H3Sampler:
                 del engine
             gc.collect()
             torch.cuda.empty_cache()
+            handle.execution_lock.release()
