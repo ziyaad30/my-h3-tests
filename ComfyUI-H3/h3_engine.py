@@ -454,6 +454,11 @@ class H3InferenceEngine:
         self.transformer_blocks = transformer_blocks
         self.seed = int(seed)
         self.lora = lora
+        if self.lora is not None:
+            for block in self.transformer_blocks:
+                block.lora = self.lora.load_block(
+                    "blocks", block.block_index, block.device
+                )
         self.row_tile = CUDA_ROW_TILE
 
         self.layout = build_packed_layout(
