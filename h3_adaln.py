@@ -76,7 +76,7 @@ class StreamingAdaLN:
     Final projection:
         [N, 8] -> [N, 2, 5376]
 
-    Official SiLU is applied to interpolated curve inputs before the AdaLN linear projection.
+    No SiLU is applied to curve-basis inputs.
     """
 
     def __init__(self, gguf, row_tile=DEFAULT_ROW_TILE):
@@ -185,11 +185,6 @@ class StreamingAdaLN:
         curves = interpolate_adaln_table(
             self.table, timesteps
         )
-
-        # Match ComfyUI AdalnProj.forward(): the interpolated curve
-        # coordinates pass through SiLU before the checkpoint linear.
-        # logaddexp keeps the sigmoid calculation numerically stable.
-        curves = curves * np.exp(-np.logaddexp(0.0, -curves))
 
         bias = self._read_f16_bias(
             self.gguf.path,
