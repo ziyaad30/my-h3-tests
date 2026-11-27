@@ -245,10 +245,9 @@ class H3ModelPatcher(ModelPatcher):
     def handle(self):
         return self.model.handle
 
-    def is_dynamic(self):
-        # H3 streams weights on demand from the checkpoint mmap.
-        return True
-
+    # Keep the base ModelPatcher lifecycle. Returning True here would opt into
+    # ComfyUI's separate dynamic-patcher protocol (including prompt-tracker
+    # methods) that this streamed runtime does not implement.
     def model_size(self):
         # ComfyUI manages the maximum simultaneously resident FP32 weight tile,
         # not the complete disk-backed GGUF checkpoint.
