@@ -4,7 +4,6 @@ import ctypes
 import gc
 import math
 import time
-from pathlib import Path
 import numpy as np
 import torch
 from .h3_stream_linear import DEFAULT_GGUF, GGUF, TiledGGUFLinear
@@ -16,20 +15,8 @@ from .h3_transformer_ops import (
 from .h3_scheduler import H3FlowScheduler
 from .h3_lora import H3TurboLoRA
 
-# Paths and verified H3 constants
+# Verified H3 architecture constants
 # ---------------------------------------------------------------------------
-
-QWEN_MODEL_DEFAULT = Path(
-    "C:/Users/User/PycharmProjects/anotherVideo/lingbot_models/"
-    "models--bartowski--Qwen_Qwen3-VL-4B-Instruct-GGUF/"
-    "snapshots/30cab06d3c6ade289ddc97a9d7c75c2b847ff32a/"
-    "Qwen_Qwen3-VL-4B-Instruct-Q4_K_M.gguf"
-)
-
-CLIP_PROJECTION_DEFAULT = Path(
-    "C:/Users/User/PycharmProjects/pythonProject/models/"
-    "clip_projections/mmh3-4b-ClipProj-v3.1.safetensors"
-)
 
 HIDDEN_SIZE = 5376
 TEXT_INPUT_SIZE = 5120
