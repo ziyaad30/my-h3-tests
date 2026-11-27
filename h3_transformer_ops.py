@@ -436,6 +436,7 @@ class H3TransformerBlock:
             token_tile=DEFAULT_TOKEN_TILE,
             query_chunk=DEFAULT_QUERY_CHUNK,
             key_chunk=DEFAULT_KEY_CHUNK,
+            lora=None,
     ):
         self.gguf = gguf
         self.block_index = int(block_index)
@@ -492,6 +493,10 @@ class H3TransformerBlock:
         )
 
         self._validate_checkpoint_shapes()
+        self.lora = (
+            lora.load_block("blocks", self.block_index, self.device)
+            if lora is not None else None
+        )
 
         self.norm1_weight = self.norm1_weight.to(self.device)
         self.norm2_weight = self.norm2_weight.to(self.device)
@@ -686,6 +691,8 @@ class H3TransformerBlock:
             raise RuntimeError(
                 f"Unexpected QKV shape: {tuple(qkv.shape)}"
             )
+        if self.lora is not None:
+            self.lora.add_qkv(normalized, qkv)
 
         qkv = qkv.reshape(
             token_count,
@@ -755,6 +762,8 @@ class H3TransformerBlock:
             device=self.device,
             dtype=torch.float32,
         )
+        if self.lora is not None:
+            self.lora.add_linear("out_proj", attention, attention_output)
 
         del attention_cpu, attention
 
@@ -802,7 +811,7 @@ class H3TransformerBlock:
             dtype=torch.float32,
         )
 
-        del fc1_cpu, normalized
+        del fc1_cpu
 
         if fc1_output.shape != (
                 token_count,
@@ -811,6 +820,9 @@ class H3TransformerBlock:
             raise RuntimeError(
                 f"Unexpected FC1 shape: {tuple(fc1_output.shape)}"
             )
+        if self.lora is not None:
+            self.lora.add_linear("fc1", normalized, fc1_output)
+        del normalized
 
         # ----------------------------------------------------
         # SWIGLU
@@ -830,6 +842,8 @@ class H3TransformerBlock:
             device=self.device,
             dtype=torch.float32,
         )
+        if self.lora is not None:
+            self.lora.add_linear("fc2", mlp_hidden, mlp_output)
 
         del fc2_cpu, mlp_hidden
 
@@ -1647,7 +1661,7 @@ class H3TokenRefiner:
     Keeps the refiner activations on CPU to avoid unnecessary VRAM use.
     """
 
-    def __init__(self, gguf, block_index, row_tile=8, token_tile=16):
+    def __init__(self, gguf, block_index, row_tile=8, token_tile=16, lora=None):
         self.gguf = gguf
         self.block_index = block_index
         self.prefix = f"token_refiner.blocks.{block_index}"
@@ -1663,6 +1677,10 @@ class H3TokenRefiner:
         self.attn_out = self._linear("attn.out_proj.weight")
         self.fc1 = self._linear("mlp.fc1.weight")
         self.fc2 = self._linear("mlp.fc2.weight")
+        self.lora = (
+            lora.load_block("token_refiner", self.block_index, "cpu")
+            if lora is not None else None
+        )
 
     def _vector(self, suffix):
         value = read_checkpoint_vector(
@@ -1693,6 +1711,8 @@ class H3TokenRefiner:
         normalized = rms_norm(hidden, self.norm1)
 
         qkv = self.qkv(normalized)
+        if self.lora is not None:
+            self.lora.add_qkv(normalized, qkv)
         qkv = qkv.reshape(hidden.shape[0], 3, 56, 128)
 
         q = qkv[:, 0]
@@ -1711,15 +1731,22 @@ class H3TokenRefiner:
         )
 
         attended = attended.reshape(hidden.shape[0], 7168)
-        attended = self.attn_out(attended)
+        attention_input = attended
+        attended = self.attn_out(attention_input)
+        if self.lora is not None:
+            self.lora.add_linear("out_proj", attention_input, attended)
 
         hidden = hidden + attended
 
         # MLP: pre-norm -> SwiGLU -> output projection -> residual.
         normalized = rms_norm(hidden, self.norm2)
         expanded = self.fc1(normalized)
+        if self.lora is not None:
+            self.lora.add_linear("fc1", normalized, expanded)
         activated = swiglu(expanded)
         projected = self.fc2(activated)
+        if self.lora is not None:
+            self.lora.add_linear("fc2", activated, projected)
 
         hidden = hidden + projected
 
