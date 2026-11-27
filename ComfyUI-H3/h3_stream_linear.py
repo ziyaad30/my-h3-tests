@@ -829,6 +829,7 @@ class TiledGGUFLinear:
             raw_bytes = 0
             host_weight_bytes = 0
             vram_weight_bytes = 0
+            host_tile_lease = None
 
             try:
                 raw = self.gguf.read_tensor_rows(
@@ -853,12 +854,23 @@ class TiledGGUFLinear:
                         f"Non-finite weight values in {self.name}"
                     )
 
-                weight = torch.from_numpy(
-                    np.ascontiguousarray(weight_np)
-                ).to(
-                    device=self.device,
-                    dtype=torch.float32,
-                )
+                # In ComfyUI, stage decoded CUDA weight tiles through
+                # the dynamic ModelPatcher's managed HostBuffer pool. Standalone
+                # inference retains the original ordinary-CPU staging path.
+                patcher = getattr(self.gguf, "comfy_model_patcher", None)
+                if self.device.type == "cuda" and patcher is not None:
+                    host_tile_lease = patcher.stage_host_tile(weight_np)
+                    weight = host_tile_lease["tensor"].to(
+                        device=self.device,
+                        dtype=torch.float32,
+                    )
+                else:
+                    weight = torch.from_numpy(
+                        np.ascontiguousarray(weight_np)
+                    ).to(
+                        device=self.device,
+                        dtype=torch.float32,
+                    )
 
                 if weight.device.type == "cuda":
                     vram_weight_bytes = weight.numel() * weight.element_size()
@@ -872,6 +884,8 @@ class TiledGGUFLinear:
                     weight.T,
                 )
             finally:
+                if host_tile_lease is not None:
+                    patcher.release_host_tile(host_tile_lease)
                 if vram_weight_bytes:
                     self.gguf.memory_stats.remove_vram(vram_weight_bytes)
                 if weight is not None:
