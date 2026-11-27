@@ -34,9 +34,9 @@ TARGETS = {
 class H3LoRABlock:
     """One block's LoRA factors, resident only for that block execution."""
 
-    def __init__(self, pairs, scale, device):
+    def __init__(self, pairs, scales, device):
         self.pairs = pairs
-        self.scale = float(scale)
+        self.scales = {name: float(value) for name, value in scales.items()}
         self.device = torch.device(device)
 
     @torch.inference_mode()
@@ -52,7 +52,7 @@ class H3LoRABlock:
                 f"{tuple(x.shape)} vs [tokens,{a.shape[1]}]"
             )
         hidden = torch.matmul(x, a.transpose(0, 1))
-        return torch.matmul(hidden, b.transpose(0, 1)) * self.scale
+        return torch.matmul(hidden, b.transpose(0, 1)) * self.scales[target]
 
     @torch.inference_mode()
     def add_qkv(self, x, output):
@@ -103,17 +103,16 @@ class H3TurboLoRA:
         if not math.isfinite(self.strength) or self.strength < 0:
             raise ValueError("LoRA strength must be finite and nonnegative")
 
-        self.alpha = DEFAULT_ALPHA
+        self.metadata_alpha = None
         self.rank = RANK
-        self.scale = self.alpha / self.rank * self.strength
         self._validate_checkpoint()
 
     @staticmethod
     def _raw_prefix(scope: str, index: int) -> str:
         if scope == "blocks":
-            return f"transformer.transformer_blocks.{index}"
+            return f"transformer_blocks.{index}"
         if scope == "token_refiner":
-            return f"transformer.token_refiner.refiner_blocks.{index}"
+            return f"token_refiner.refiner_blocks.{index}"
         raise ValueError(f"Unknown H3 LoRA scope: {scope}")
 
     def _expected_shapes(self):
@@ -140,22 +139,32 @@ class H3TurboLoRA:
             raw_alpha = metadata.get("alpha")
             if raw_alpha is not None:
                 try:
-                    self.alpha = float(raw_alpha)
+                    self.metadata_alpha = float(raw_alpha)
                 except (TypeError, ValueError) as exc:
                     raise ValueError(
                         f"Invalid Turbo LoRA metadata alpha: {raw_alpha!r}"
                     ) from exc
-            if not math.isfinite(self.alpha) or self.alpha <= 0:
-                raise ValueError(f"Invalid Turbo LoRA alpha: {self.alpha!r}")
+                if not math.isfinite(self.metadata_alpha) or self.metadata_alpha <= 0:
+                    raise ValueError(f"Invalid Turbo LoRA metadata alpha: {self.metadata_alpha!r}")
 
             actual = set(checkpoint.keys())
             expected_keys = set(expected)
+            pair_prefixes = sorted({name.rsplit(".lora_", 1)[0] for name in expected_keys})
+            alpha_keys = {prefix + ".alpha" for prefix in pair_prefixes}
+            allowed_keys = expected_keys | (actual & alpha_keys)
             missing = sorted(expected_keys - actual)
-            unexpected = sorted(actual - expected_keys)
+            unexpected = sorted(actual - allowed_keys)
+            missing_alpha = [prefix for prefix in pair_prefixes
+                             if prefix + ".alpha" not in actual and self.metadata_alpha is None]
+            if missing_alpha:
+                raise ValueError(
+                    "Turbo LoRA has no per-layer or metadata alpha for "
+                    f"{len(missing_alpha)} pairs; first missing: {missing_alpha[:5]}"
+                )
             if missing or unexpected:
                 raise ValueError(
                     "Turbo LoRA tensor inventory mismatch: "
-                    f"expected {len(expected_keys)} tensors, found {len(actual)}; "
+                    f"expected {len(expected_keys)} factor tensors, found {len(actual)}; "
                     f"missing={missing[:5]}, unexpected={unexpected[:5]}"
                 )
 
@@ -167,11 +176,11 @@ class H3TurboLoRA:
                         f"expected={shape}"
                     )
 
-        self.scale = self.alpha / self.rank * self.strength
         print(
             f"Turbo LoRA validated: {self.path.name} | "
-            f"312 target pairs | rank={self.rank} | alpha={self.alpha:g} | "
-            f"strength={self.strength:g} | effective scale={self.scale:g}",
+            f"312 target pairs | rank={self.rank} | "
+            f"alpha source={'per-layer tensors' if any(k.endswith('.alpha') for k in actual) else 'file metadata'} | "
+            f"strength={self.strength:g}",
             flush=True,
         )
 
@@ -179,7 +188,9 @@ class H3TurboLoRA:
     def load_block(self, scope: str, index: int, device: str | torch.device):
         prefix = self._raw_prefix(scope, int(index))
         pairs = {}
+        scales = {}
         with safe_open(str(self.path), framework="pt", device="cpu") as checkpoint:
+            metadata_alpha = (checkpoint.metadata() or {}).get("alpha")
             for target, (input_width, output_width) in TARGETS.items():
                 base = f"{prefix}.{target}"
                 a_name = f"{base}.lora_A.default.weight"
@@ -203,10 +214,20 @@ class H3TurboLoRA:
                     value, gate = b.chunk(2, dim=0)
                     b = torch.cat((gate, value), dim=0).contiguous()
 
+                alpha_key = base + ".alpha"
+                if alpha_key in checkpoint.keys():
+                    alpha = float(checkpoint.get_tensor(alpha_key).float().item())
+                elif metadata_alpha is not None:
+                    alpha = float(metadata_alpha)
+                else:
+                    raise RuntimeError(f"Validated Turbo LoRA alpha missing: {alpha_key}")
+                if not math.isfinite(alpha) or alpha <= 0:
+                    raise ValueError(f"Invalid Turbo LoRA alpha for {base}: {alpha}")
                 if not torch.isfinite(a).all() or not torch.isfinite(b).all():
                     raise FloatingPointError(
                         f"Non-finite Turbo LoRA factors in {base}"
                     )
                 pairs[target] = (a.contiguous(), b.contiguous())
+                scales[target] = alpha / RANK * self.strength
 
-        return H3LoRABlock(pairs, self.scale, device)
+        return H3LoRABlock(pairs, scales, device)
