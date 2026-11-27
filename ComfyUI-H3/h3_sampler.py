@@ -33,7 +33,7 @@ class H3Sampler:
             }
         }
 
-    RETURN_TYPES = ("H3_VIDEO_LATENT", "H3_AUDIO_LATENT")
+    RETURN_TYPES = ("LATENT", "LATENT")
     RETURN_NAMES = ("video_latent", "audio_latent")
     FUNCTION = "sample"
     CATEGORY = "MiniMax H3/Sampling"
@@ -128,9 +128,20 @@ class H3Sampler:
                 f"[H3 Sampler] Joint audio/video sampling completed in {elapsed:.2f}s.",
                 flush=True,
             )
+            # Standard ComfyUI LATENT payloads. Keeping the two modalities
+            # separate makes each output directly consumable by compatible
+            # video/audio latent decoder nodes.
             return (
-                video_latent.detach().to(device="cpu", dtype=torch.float32).contiguous(),
-                audio_latent.detach().to(device="cpu", dtype=torch.float32).contiguous(),
+                {
+                    "samples": video_latent.detach().to(
+                        device="cpu", dtype=torch.float32
+                    ).contiguous(),
+                },
+                {
+                    "samples": audio_latent.detach().to(
+                        device="cpu", dtype=torch.float32
+                    ).contiguous(),
+                },
             )
         finally:
             # This also runs when ComfyUI raises its native interruption
