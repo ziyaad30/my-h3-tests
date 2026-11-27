@@ -444,8 +444,14 @@ class H3InferenceEngine:
         audio_t: int,
         seed: int,
         lora: H3TurboLoRA | None = None,
+        transformer_blocks: torch.nn.ModuleList | None = None,
     ):
         self.gguf = gguf
+        if transformer_blocks is None or len(transformer_blocks) != NUM_BLOCKS:
+            raise ValueError(
+                f"H3 requires {NUM_BLOCKS} registered transformer block modules."
+            )
+        self.transformer_blocks = transformer_blocks
         self.seed = int(seed)
         self.lora = lora
         self.row_tile = CUDA_ROW_TILE
@@ -700,16 +706,7 @@ class H3InferenceEngine:
                 device="cpu",
             )
 
-            block = H3TransformerBlock(
-                self.gguf,
-                block_index=block_index,
-                device="cuda:0",
-                row_tile=CUDA_ROW_TILE,
-                token_tile=TOKEN_TILE,
-                query_chunk=QUERY_CHUNK,
-                key_chunk=KEY_CHUNK,
-                lora=self.lora,
-            )
+            block = self.transformer_blocks[block_index]
 
             # hidden stays in CPU RAM between blocks. The block moves its
             # active working tensors to CUDA and returns the result to CPU.
@@ -721,7 +718,7 @@ class H3InferenceEngine:
                 self.inv_freq,
             )
 
-            del block, modulation_table, adaln_indices
+            del modulation_table, adaln_indices
             torch.cuda.synchronize()
 
             # Report each completed transformer block to ComfyUI. The node's
