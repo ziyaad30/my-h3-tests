@@ -262,8 +262,8 @@ class H3ModelLoader:
 
         handle = H3ModelHandle(path)
 
-        # Return a ComfyUI dynamic ModelPatcher so the prompt tracker and
-        # dynamic model manager use their native lifecycle for this runtime.
+        # The standard ComfyUI ModelPatcher owns the H3 transformer module.
+        # The GGUF reader remains only the transformer's streamed checkpoint source.
         import comfy.model_management
 
         transformer = H3Transformer(handle)
