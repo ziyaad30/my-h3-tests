@@ -16,6 +16,7 @@ import argparse
 import math
 import sys
 import wave
+import struct
 from pathlib import Path
 from fractions import Fraction
 
@@ -291,40 +292,111 @@ def load_full_checkpoint(model, checkpoint_path):
 # Other sample rates are resampled with scipy when available.
 # ---------------------------------------------------------------------
 
+def _read_ieee_float_wav(path):
+    """Read a little-endian IEEE-float RIFF/WAVE file (format tag 3)."""
+    data = Path(path).read_bytes()
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        raise ValueError("Expected a RIFF/WAVE file.")
+
+    fmt = None
+    audio = None
+    offset = 12
+    while offset + 8 <= len(data):
+        chunk_id = data[offset:offset + 4]
+        chunk_size = struct.unpack_from("<I", data, offset + 4)[0]
+        start = offset + 8
+        end = start + chunk_size
+        if end > len(data):
+            raise ValueError(f"Truncated WAV {chunk_id!r} chunk.")
+        if chunk_id == b"fmt ":
+            fmt = data[start:end]
+        elif chunk_id == b"data":
+            audio = data[start:end]
+        offset = end + (chunk_size & 1)
+
+    if fmt is None or audio is None or len(fmt) < 16:
+        raise ValueError("WAV is missing a valid fmt or data chunk.")
+
+    format_tag, channels, rate, byte_rate, block_align, bits = struct.unpack_from(
+        "<HHIIHH", fmt, 0
+    )
+    if format_tag != 3:
+        raise ValueError(f"Expected IEEE-float WAV format tag 3, found {format_tag}.")
+    if channels not in (1, 2):
+        raise ValueError(f"Expected mono or stereo WAV, found {channels} channels.")
+    if bits == 32:
+        dtype = "<f4"
+    elif bits == 64:
+        dtype = "<f8"
+    else:
+        raise ValueError(f"Unsupported IEEE-float WAV bit depth: {bits}.")
+    if block_align != channels * (bits // 8):
+        raise ValueError("Invalid WAV block alignment.")
+    if len(audio) % block_align:
+        raise ValueError("WAV data size is not a whole number of audio frames.")
+
+    samples = np.frombuffer(audio, dtype=dtype).astype(np.float32)
+    if not np.isfinite(samples).all():
+        raise ValueError("Input WAV contains NaN or Inf samples.")
+    return samples.reshape(-1, channels).T, channels, rate
+
+
 def read_wav(path):
     path = Path(path)
-    with wave.open(str(path), "rb") as wav:
-        channels = wav.getnchannels()
-        width = wav.getsampwidth()
-        rate = wav.getframerate()
-        frames = wav.getnframes()
-        comptype = wav.getcomptype()
-        raw = wav.readframes(frames)
 
-    if comptype != "NONE":
-        raise ValueError(f"Compressed WAV is not supported: {comptype}")
-    if channels not in (1, 2):
-        raise ValueError(f"Expected mono or stereo WAV, found {channels} channels")
+    # Python's wave module rejects IEEE-float WAV (format tag 3).
+    # Detect that format from the RIFF header and read float samples directly.
+    with path.open("rb") as stream:
+        header = stream.read(12)
+    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WAVE":
+        raw_bytes = path.read_bytes()
+        offset = 12
+        format_tag = None
+        while offset + 8 <= len(raw_bytes):
+            chunk_id = raw_bytes[offset:offset + 4]
+            chunk_size = struct.unpack_from("<I", raw_bytes, offset + 4)[0]
+            if chunk_id == b"fmt " and chunk_size >= 2:
+                format_tag = struct.unpack_from("<H", raw_bytes, offset + 8)[0]
+                break
+            offset += 8 + chunk_size + (chunk_size & 1)
 
-    if width == 1:
-        samples = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
-    elif width == 2:
-        samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
-    elif width == 3:
-        data = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
-        values = (
-            data[:, 0].astype(np.int32)
-            | (data[:, 1].astype(np.int32) << 8)
-            | (data[:, 2].astype(np.int32) << 16)
-        )
-        values = np.where(values & 0x800000, values - 0x1000000, values)
-        samples = values.astype(np.float32) / 8388608.0
-    elif width == 4:
-        samples = np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648.0
+        if format_tag == 3:
+            samples, channels, rate = _read_ieee_float_wav(path)
+        else:
+            with wave.open(str(path), "rb") as wav:
+                channels = wav.getnchannels()
+                width = wav.getsampwidth()
+                rate = wav.getframerate()
+                frames = wav.getnframes()
+                comptype = wav.getcomptype()
+                raw = wav.readframes(frames)
+
+            if comptype != "NONE":
+                raise ValueError(f"Compressed WAV is not supported: {comptype}")
+            if channels not in (1, 2):
+                raise ValueError(f"Expected mono or stereo WAV, found {channels} channels")
+
+            if width == 1:
+                samples = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+            elif width == 2:
+                samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+            elif width == 3:
+                data = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
+                values = (
+                    data[:, 0].astype(np.int32)
+                    | (data[:, 1].astype(np.int32) << 8)
+                    | (data[:, 2].astype(np.int32) << 16)
+                )
+                values = np.where(values & 0x800000, values - 0x1000000, values)
+                samples = values.astype(np.float32) / 8388608.0
+            elif width == 4:
+                samples = np.frombuffer(raw, dtype="<i4").astype(np.float32) / 2147483648.0
+            else:
+                raise ValueError(f"Unsupported PCM sample width: {width * 8}-bit")
+            samples = samples.reshape(-1, channels).T
     else:
-        raise ValueError(f"Unsupported PCM sample width: {width * 8}-bit")
+        raise ValueError("Expected a RIFF/WAVE file.")
 
-    samples = samples.reshape(-1, channels).T
     if channels == 1:
         samples = np.repeat(samples, 2, axis=0)
 
