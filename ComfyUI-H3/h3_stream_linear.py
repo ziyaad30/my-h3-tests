@@ -758,7 +758,7 @@ def decode_weight_tile(raw, ggml_type, row_count, input_width):
 # STREAMED LINEAR
 # ============================================================
 
-class TiledGGUFLinear:
+class TiledGGUFLinear(torch.nn.Module):
 
     def __init__(
         self,
@@ -768,6 +768,8 @@ class TiledGGUFLinear:
         row_tile=8,
         token_tile=16,
     ):
+
+        super().__init__()
 
         if tensor_name not in gguf.tensors:
             raise KeyError(
@@ -828,7 +830,7 @@ class TiledGGUFLinear:
         )
 
     @torch.inference_mode()
-    def __call__(self, x):
+    def forward(self, x):
 
         if not isinstance(x, torch.Tensor):
             x = torch.as_tensor(
