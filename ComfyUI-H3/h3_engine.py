@@ -712,16 +712,20 @@ class H3InferenceEngine:
 
             block = self.transformer_blocks[block_index]
 
-            # Load only this block's LoRA factors. Keeping all 50 adapters
-            # resident would defeat the memory-bounded streamed execution.
-            if self.lora is not None:
-                block.lora = self.lora.load_block(
-                    "blocks", block.block_index, block.device
-                )
-
-            # hidden stays in CPU RAM between blocks. The block moves its
-            # active working tensors to CUDA and returns the result to CPU.
+            # Stage only the active block's small norm buffers on CUDA.
+            # Projection matrices remain mmap-backed and are decoded by row
+            # tile; all inactive block buffers remain on CPU.
+            block.to(device="cuda:0")
             try:
+                # Load only this block's LoRA factors. Keeping all 50 adapters
+                # resident would defeat the memory-bounded streamed execution.
+                if self.lora is not None:
+                    block.lora = self.lora.load_block(
+                        "blocks", block.block_index, block.device
+                    )
+
+                # hidden stays in CPU RAM between blocks. The active block
+                # computes on CUDA and returns its output to CPU.
                 hidden = block(
                     hidden,
                     modulation_table,
@@ -731,6 +735,9 @@ class H3InferenceEngine:
                 )
             finally:
                 block.lora = None
+                # Return the block's norm buffers and projection device to CPU
+                # before the next block is staged.
+                block.to(device="cpu")
 
             del modulation_table, adaln_indices
             torch.cuda.synchronize()
