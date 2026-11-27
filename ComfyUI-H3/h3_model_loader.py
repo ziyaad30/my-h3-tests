@@ -12,6 +12,95 @@ import torch
 import folder_paths
 from comfy.model_patcher import ModelPatcher
 
+class H3ModelPatcher(ModelPatcher):
+    """ComfyUI lifecycle adapter for the mmap-backed H3 runtime.
+
+    ComfyUI owns and schedules this patcher, but must never recursively move
+    the H3 module tree or try to load GGUF-backed projections as parameters.
+    Only the active transformer block is moved to CUDA by H3InferenceEngine.
+    """
+
+    def __init__(
+        self,
+        model,
+        load_device,
+        offload_device,
+        size=0,
+        weight_inplace_update=False,
+        fast_disk=False,
+    ):
+        working_set = int(getattr(model, "working_set_bytes", size))
+        super().__init__(
+            model,
+            load_device,
+            offload_device,
+            size=working_set,
+            weight_inplace_update=weight_inplace_update,
+            fast_disk=fast_disk,
+        )
+        self._h3_working_set_bytes = working_set
+        self.model.model_loaded_weight_memory = 0
+        self.model.model_offload_buffer_memory = 0
+
+    def model_size(self):
+        # Account for the maximum streamed FP32 tile, not the mmap file size.
+        return self._h3_working_set_bytes
+
+    def loaded_size(self):
+        return int(self.model.model_loaded_weight_memory)
+
+    def model_dtype(self):
+        return torch.float32
+
+    def model_patches_to(self, device):
+        # H3 LoRA factors are streamed explicitly by H3InferenceEngine.
+        return None
+
+    def partially_load(self, device_to, extra_memory=0, force_patch_weights=False):
+        if self.model.handle.closed or self.model.handle.gguf is None:
+            raise RuntimeError("Cannot load a closed H3 GGUF runtime.")
+        previous = self.loaded_size()
+        self.model.device = device_to
+        self.model.model_loaded_weight_memory = self._h3_working_set_bytes
+        self.model.model_lowvram = False
+        return max(0, self._h3_working_set_bytes - previous)
+
+    def partially_unload(self, device_to, memory_to_free=0, force_patch_weights=False):
+        previous = self.loaded_size()
+        self.model.model_loaded_weight_memory = 0
+        self.model.device = device_to
+        return previous
+
+    def patch_model(
+        self,
+        device_to=None,
+        lowvram_model_memory=0,
+        load_weights=True,
+        force_patch_weights=False,
+    ):
+        # There are no torch Parameters to patch; keep the runtime attached.
+        if device_to is not None:
+            self.model.device = device_to
+        return self.model
+
+    def unpatch_model(self, device_to=None, unpatch_weights=True):
+        # Eviction must not move or destroy the mapped H3 runtime.
+        if device_to is not None:
+            self.model.device = device_to
+        if unpatch_weights:
+            self.model.model_loaded_weight_memory = 0
+        return self.model
+
+    def detach(self, unpatch_all=True):
+        self.model.device = self.offload_device
+        self.model.model_loaded_weight_memory = 0
+        return self.model
+
+    def current_loaded_device(self):
+        return self.model.device
+
+
+
 # ---------------------------------------------------------------------------
 # Streamed H3 transformer checkpoint loader
 # ---------------------------------------------------------------------------
@@ -159,7 +248,7 @@ class H3Transformer(torch.nn.Module):
             H3TransformerBlock(
                 handle.gguf,
                 block_index=index,
-                device="cuda:0",
+                device="cpu",
                 row_tile=CUDA_ROW_TILE,
                 token_tile=TOKEN_TILE,
                 query_chunk=QUERY_CHUNK,
@@ -282,19 +371,20 @@ class H3ModelLoader:
 
         handle = H3ModelHandle(path)
 
-        # The standard ComfyUI ModelPatcher owns the H3 transformer module.
-        # The GGUF reader remains only the transformer's streamed checkpoint source.
+        # The H3-aware patcher owns the transformer runtime and mapped
+        # checkpoint. ComfyUI manages lifecycle without moving all 50 blocks;
+        # the engine stages only the active block on CUDA.
         import comfy.model_management
 
         transformer = H3Transformer(handle)
-        patcher = ModelPatcher(
+        patcher = H3ModelPatcher(
             transformer,
             load_device=comfy.model_management.get_torch_device(),
             offload_device=comfy.model_management.unet_offload_device(),
             size=transformer.working_set_bytes,
         )
         print(
-            f"[H3 Model Loader] Registered streamed MODEL with ComfyUI "
+            f"[H3 Model Loader] Registered H3 runtime with custom ModelPatcher "
             f"(GGUF mmap: {handle.file_size / (1024 ** 3):.2f} GiB; "
             f"maximum managed FP32 weight tile: "
             f"{transformer.working_set_bytes / (1024 ** 2):.2f} MiB).",
