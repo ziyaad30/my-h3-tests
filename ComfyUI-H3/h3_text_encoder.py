@@ -303,3 +303,81 @@ class H3TextEncoder:
                 projection_path,
                 unload_after_encode,
             )
+
+
+class H3Conditioning:
+    """
+    Standard ComfyUI CONDITIONING wrapper for MiniMax H3 text conditioning.
+
+    This node deliberately uses a temporary Qwen context and releases both
+    Qwen and ClipProj resources after every execution. The underlying
+    extraction remains the same production path used by H3TextEncoder.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        qwen_files = folder_paths.get_filename_list("h3_qwen_gguf")
+        projection_files = folder_paths.get_filename_list("clip_projections")
+
+        if not qwen_files:
+            qwen_files = ["<put Qwen GGUF in models/text_encoders>"]
+        if not projection_files:
+            projection_files = ["<put ClipProj in models/clip_projections>"]
+
+        return {
+            "required": {
+                "positive": ("STRING", {"multiline": True, "default": ""}),
+                "qwen_model": (qwen_files,),
+                "clip_projection": (projection_files,),
+            }
+        }
+
+    RETURN_TYPES = ("CONDITIONING",)
+    RETURN_NAMES = ("conditioning",)
+    FUNCTION = "encode"
+    CATEGORY = "WAFFLES"
+    TITLE = "H3 Conditioning"
+
+    def encode(self, positive, qwen_model, clip_projection):
+        if qwen_model.startswith("<put ") or clip_projection.startswith("<put "):
+            raise RuntimeError(
+                "H3 model files were not found. Place Qwen GGUF in "
+                "ComfyUI/models/text_encoders and ClipProj in "
+                "ComfyUI/models/clip_projections, then refresh ComfyUI."
+            )
+
+        qwen_path = folder_paths.get_full_path("h3_qwen_gguf", qwen_model)
+        projection_path = folder_paths.get_full_path(
+            "clip_projections", clip_projection
+        )
+        if qwen_path is None:
+            raise FileNotFoundError(f"Could not resolve Qwen model: {qwen_model}")
+        if projection_path is None:
+            raise FileNotFoundError(
+                f"Could not resolve ClipProj file: {clip_projection}"
+            )
+
+        with _ENCODER_LOCK:
+            (text_conditioning,) = _encode(
+                positive,
+                qwen_path,
+                projection_path,
+                unload_after_encode=True,
+            )
+
+        if text_conditioning.ndim != 2 or text_conditioning.shape[1] != 5120:
+            raise RuntimeError(
+                "H3 text conditioning must have shape [tokens, 5120], "
+                f"got {tuple(text_conditioning.shape)}"
+            )
+        if text_conditioning.dtype != torch.float32:
+            text_conditioning = text_conditioning.float()
+
+        # ComfyUI CONDITIONING convention: a list of [batched tensor, metadata].
+        # H3's packed-sequence modality tags and positional IDs are created
+        # later by the H3 sampler when it assembles text, keyframes, audio,
+        # and video rows; they are not text-encoder metadata.
+        cond = text_conditioning.unsqueeze(0).contiguous()
+        metadata = {"pooled_output": None}
+        return ([[cond, metadata]],)
+
