@@ -335,7 +335,7 @@ class H3Conditioning:
     RETURN_TYPES = ("CONDITIONING",)
     RETURN_NAMES = ("conditioning",)
     FUNCTION = "encode"
-    CATEGORY = "WAFFLES"
+    CATEGORY = "MiniMax H3/Conditioning"
     TITLE = "H3 Conditioning"
 
     def encode(self, positive, qwen_model, clip_projection):
