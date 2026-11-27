@@ -137,8 +137,8 @@ class H3ModelHandle:
             pass
 
 
-class H3TransformerRuntime(torch.nn.Module):
-    """Lightweight runtime object owned by ComfyUI's ModelPatcher.
+class H3Transformer(torch.nn.Module):
+    """Streamed H3 transformer owned directly by ComfyUI's ModelPatcher.
 
     Transformer weights remain in the read-only GGUF mapping and are streamed
     by H3InferenceEngine. This module intentionally has no Parameter tensors,
@@ -148,6 +148,7 @@ class H3TransformerRuntime(torch.nn.Module):
     def __init__(self, handle):
         super().__init__()
         self.handle = handle
+        self.working_set_bytes = int(handle.gguf.stream_working_set_bytes)
         # Let ModelPatcher initialize this to its configured offload_device.
         self.device = None
 
@@ -169,7 +170,7 @@ class H3TransformerRuntime(torch.nn.Module):
         keyframes=None,
         lora=None,
     ):
-        """Execute joint H3 denoising through the transformer owned by this patcher."""
+        """Execute joint H3 denoising through this ComfyUI-managed transformer."""
         import gc
 
         from .h3_engine import (
@@ -265,18 +266,18 @@ class H3ModelLoader:
         # dynamic model manager use their native lifecycle for this runtime.
         import comfy.model_management
 
-        runtime = H3TransformerRuntime(handle)
+        transformer = H3Transformer(handle)
         patcher = ModelPatcher(
-            runtime,
+            transformer,
             load_device=comfy.model_management.get_torch_device(),
             offload_device=comfy.model_management.unet_offload_device(),
-            size=handle.gguf.stream_working_set_bytes,
+            size=transformer.working_set_bytes,
         )
         print(
             f"[H3 Model Loader] Registered streamed MODEL with ComfyUI "
             f"(GGUF mmap: {handle.file_size / (1024 ** 3):.2f} GiB; "
             f"maximum managed FP32 weight tile: "
-            f"{runtime.handle.gguf.stream_working_set_bytes / (1024 ** 2):.2f} MiB).",
+            f"{transformer.working_set_bytes / (1024 ** 2):.2f} MiB).",
             flush=True,
         )
         return (patcher,)
