@@ -5,8 +5,7 @@ Standalone MiniMax H3 streamed GGUF linear engine.
 
 Q2_K decoding:
     - Numba parallel decoder.
-    - Four CPU threads by default, based on measured performance.
-    - Exact output equality with the previous serial decoder.
+    - Four CPU threads by default.
     - Independent 256-element blocks decoded in parallel.
 
 Memory:
@@ -16,6 +15,7 @@ Memory:
     - No pinned-memory staging buffers.
 
 CUDA projections:
+    - CUDA row tile minimum: 2048.
     - Activations transferred once per projection.
     - Weight tiles transferred once.
     - FP32 weights and FP32 matmul retained.
@@ -23,6 +23,7 @@ CUDA projections:
 
 CPU projections:
     - Output remains on CPU.
+    - Requested row tile is retained.
 
 Supported GGML types:
     0  F32
@@ -60,12 +61,13 @@ TYPE_BF16 = 30
 Q2K_BLOCK_ELEMENTS = 256
 Q2K_BLOCK_BYTES = 84
 
-CUDA_MIN_ROW_TILE = 128
+# Measured on the GTX 1650:
+# 2048 was fastest in both streamed linear and transformer
+# block tests. Eight-block propagation also remained stable.
+CUDA_MIN_ROW_TILE = 2048
 
 # Four threads was the fastest measured setting on the
 # user's 8-logical-processor CPU.
-#
-# This is limited by Numba's configured maximum.
 Q2K_NUM_THREADS = min(4, config.NUMBA_NUM_THREADS)
 
 if Q2K_NUM_THREADS < 1:
@@ -205,7 +207,7 @@ class GGUF:
                 for _ in range(count)
             ]
 
-        raise ValueError(f"Unsupported metadata type {kind}")
+        raise ValueError(f"Unsupported GGUF metadata type {kind}")
 
     @staticmethod
     def align(value, alignment):
@@ -466,8 +468,6 @@ def _decode_q2k_numba_kernel(blocks, d, dmin):
         dtype=np.float32,
     )
 
-    # Each iteration writes to a separate 256-element output
-    # region. No two workers write to the same output elements.
     for b in prange(block_count):
 
         for a in range(2):
@@ -526,16 +526,8 @@ def decode_q2k(raw):
     """
     Parallel Numba Q2_K decoder.
 
-    Accepts:
-        bytes
-        bytearray
-        memoryview
-        NumPy arrays
-
-    Returns:
-        Flat float32 NumPy array.
-
-    Uses the configured Q2K_NUM_THREADS worker threads.
+    Accepts bytes, bytearray, memoryview or NumPy arrays.
+    Returns a flat float32 NumPy array.
     """
 
     if isinstance(raw, (bytes, bytearray, memoryview)):
@@ -651,7 +643,7 @@ class TiledGGUFLinear:
             )
 
         if (
-            device.startswith("cuda")
+            str(device).startswith("cuda")
             and not torch.cuda.is_available()
         ):
             raise RuntimeError(
@@ -863,6 +855,7 @@ def main():
     print(f"Device:     {args.device}")
     print(f"Tokens:     {args.tokens}")
     print(f"Q2_K CPU threads: {Q2K_NUM_THREADS}")
+    print(f"CUDA minimum row tile: {CUDA_MIN_ROW_TILE}")
 
     with GGUF(args.gguf) as gguf:
 
@@ -917,6 +910,7 @@ def main():
                 f"{name}: PASSED | "
                 f"shape={tuple(y.shape)} | "
                 f"device={y.device} | "
+                f"row_tile={linear.row_tile} | "
                 f"time={elapsed:.4f}s"
             )
 
