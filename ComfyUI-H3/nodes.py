@@ -88,12 +88,12 @@ def _load_projection(path):
     return matrix, mean_in, std_in, mean_out, std_out, sink_out
 
 
-def _get_encoder(qwen_path, unload_after_encode):
+def _get_encoder(qwen_path, unload_after_encode, llama_class):
     global _CACHED_LLM, _CACHED_QWEN_PATH
 
     if unload_after_encode:
         _close_cached_encoder()
-        return Llama(
+        return llama_class(
             model_path=qwen_path,
             n_ctx=512,
             n_batch=512,
@@ -105,7 +105,7 @@ def _get_encoder(qwen_path, unload_after_encode):
         _close_cached_encoder()
 
     if _CACHED_LLM is None:
-        _CACHED_LLM = Llama(
+        _CACHED_LLM = llama_class(
             model_path=qwen_path,
             n_ctx=512,
             n_batch=512,
@@ -136,7 +136,7 @@ def _encode(prompt, qwen_path, projection_path, unload_after_encode):
     projection = _load_projection(projection_path)
     matrix, mean_in, std_in, mean_out, std_out, sink_out = projection
 
-    llm, is_temporary = _get_encoder(qwen_path, unload_after_encode)
+    llm, is_temporary = _get_encoder(qwen_path, unload_after_encode, Llama)
     try:
         # Reset KV state so each execution encodes only its own prompt.
         llm.reset()
