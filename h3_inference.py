@@ -46,6 +46,7 @@ from h3_transformer_ops import (
     rms_norm,
 )
 from h3_scheduler import H3FlowScheduler
+from h3_lora import H3TurboLoRA
 from minimax_h3_lightvae_decoder import decode_video_latents
 
 
@@ -668,9 +669,11 @@ class H3InferenceEngine:
         latent_w: int,
         audio_t: int,
         seed: int,
+        lora: H3TurboLoRA | None = None,
     ):
         self.gguf = gguf
         self.seed = int(seed)
+        self.lora = lora
         self.row_tile = CUDA_ROW_TILE
 
         self.layout = build_packed_layout(
@@ -719,6 +722,7 @@ class H3InferenceEngine:
                 block_index=refiner_index,
                 row_tile=CPU_ROW_TILE,
                 token_tile=TOKEN_TILE,
+                lora=self.lora,
             )
             text = refiner(text)
             del refiner
@@ -925,6 +929,7 @@ class H3InferenceEngine:
                 token_tile=TOKEN_TILE,
                 query_chunk=QUERY_CHUNK,
                 key_chunk=KEY_CHUNK,
+                lora=self.lora,
             )
 
             # hidden stays in CPU RAM between blocks. The block moves its
@@ -1035,8 +1040,9 @@ def sample(
     audio_t: int,
     steps: int,
     seed: int,
+    video_shift: float = VIDEO_SHIFT,
 ):
-    video_scheduler = H3FlowScheduler(shift=VIDEO_SHIFT)
+    video_scheduler = H3FlowScheduler(shift=video_shift)
     audio_scheduler = H3FlowScheduler(shift=AUDIO_SHIFT)
 
     # set_timesteps receives sigma points, so steps+1 points produce
@@ -1070,7 +1076,7 @@ def sample(
     print("Evaluations:", steps)
     print("Transformer blocks per evaluation:", NUM_BLOCKS)
     print("Total transformer block executions:", steps * NUM_BLOCKS)
-    print("Video shift:", VIDEO_SHIFT)
+    print("Video shift:", video_shift)
     print("Audio shift:", AUDIO_SHIFT)
     print("Seed:", seed)
 
@@ -1081,7 +1087,7 @@ def sample(
         sigma_audio = float(audio_scheduler.sigmas[index].item())
 
         mapped_audio_sigma = time_shift_sigma(
-            sigma_video, VIDEO_SHIFT, AUDIO_SHIFT
+            sigma_video, video_shift, AUDIO_SHIFT
         )
         require(
             abs(mapped_audio_sigma - sigma_audio) < 1e-6,
@@ -1151,7 +1157,12 @@ def parse_args():
     parser.add_argument("--width", type=int, default=320)
     parser.add_argument("--height", type=int, default=320)
     parser.add_argument("--frames", type=int, default=22)
-    parser.add_argument("--steps", type=int, default=7)
+    parser.add_argument("--steps", type=int, default=None,
+                        help="Denoising evaluations; defaults to 4 with Turbo LoRA, otherwise 7")
+    parser.add_argument("--lora", type=Path, default=None,
+                        help="Official MiniMax H3 FL2VA 4-step v1.2 Turbo LoRA safetensors")
+    parser.add_argument("--lora-scale", type=float, default=1.0,
+                        help="Turbo LoRA strength multiplier (default: 1.0)")
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--output-dir", type=Path, default=Path("h3_output"))
     parser.add_argument("--decoder-checkpoint", type=Path, default=Path("C:/Users/User/PycharmProjects/pythonProject/models/vae/lightvae-lite-h3-decoder.safetensors"))
@@ -1183,6 +1194,21 @@ def main():
         if decoded["mp4_path"] is not None:
             print("Decoded MP4:", decoded["mp4_path"].resolve())
         return
+    if args.lora is not None:
+        require(args.lora.name == "minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors",
+                "Only the official FL2VA 4-step v1.2 768p Turbo adapter is supported by this integration")
+        lora = H3TurboLoRA(args.lora, strength=args.lora_scale)
+        video_shift = 6.0
+        if args.steps is None:
+            args.steps = 4
+        require(args.steps == 4,
+                "This Turbo LoRA is distilled for exactly 4 denoising evaluations")
+    else:
+        lora = None
+        video_shift = VIDEO_SHIFT
+        if args.steps is None:
+            args.steps = 7
+
     require(bool(args.prompt and args.prompt.strip()), "--prompt is required unless --decode-only is used")
     require(args.gguf.is_file(), f"H3 GGUF not found: {args.gguf}")
     require(args.qwen_model.is_file(), f"Qwen model not found: {args.qwen_model}")
@@ -1231,6 +1257,10 @@ def main():
     print("Video latent:", (1, 24, latent_t, latent_h, latent_w))
     print("Audio latent:", (1, 32, 2, audio_t))
     print("Denoising evaluations:", args.steps)
+    print("Video flow shift:", video_shift)
+    if lora is not None:
+        print("Turbo LoRA:", lora.path)
+        print("Turbo LoRA strength:", lora.strength)
     print("Prompt:", args.prompt)
 
     # Run Qwen first, then close it before loading VAE/transformer work.
@@ -1265,6 +1295,7 @@ def main():
             latent_w=latent_w,
             audio_t=audio_t,
             seed=args.seed,
+            lora=lora,
         )
 
         del text_states, keyframes
@@ -1278,6 +1309,7 @@ def main():
             audio_t=audio_t,
             steps=args.steps,
             seed=args.seed,
+            video_shift=video_shift,
         )
 
         args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1293,7 +1325,9 @@ def main():
                 "height": args.height,
                 "frames": args.frames,
                 "steps": args.steps,
-                "video_shift": VIDEO_SHIFT,
+                "video_shift": video_shift,
+                "lora_path": str(lora.path) if lora is not None else None,
+                "lora_scale": lora.strength if lora is not None else None,
                 "audio_shift": AUDIO_SHIFT,
                 "video_sigmas": video_scheduler.sigmas.cpu(),
                 "audio_sigmas": audio_scheduler.sigmas.cpu(),
