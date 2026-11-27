@@ -280,22 +280,14 @@ def decode_video_latents(latents, output_dir, checkpoint=None, fps=24):
     decoder.eval()
     decoder.requires_grad_(False)
     decoder.to(device="cpu", dtype=DTYPE)
-    # Avoid unnecessary 2x2 spatial tiling for small outputs. At 320x320,
-    # the checkpoint's 256px tiles overlap by 192px after exact-fit layout,
-    # which can create visible square blend boundaries. One full-frame tile
-    # is inexpensive for this latent size and removes spatial stitching.
-    decoded_h = int(latents.shape[-2]) * 16
-    decoded_w = int(latents.shape[-1]) * 16
-    if max(decoded_h, decoded_w) <= 512:
-        required_tile = ((max(decoded_h, decoded_w) + 31) // 32) * 32
-        decoder.tile_size = max(int(decoder.tile_size), required_tile)
     decoder.decoder.rope.materialize_buffer("cpu")
     decoder.decoder.forward = types.MethodType(streaming_forward, decoder.decoder)
     decoder._decode_clip = types.MethodType(streaming_decode_clip, decoder)
 
     print("Retained decoder blocks:", decoder.config["kept_layers"])
-    print("Spatial tile size:", decoder.tile_size)
+    print("Checkpoint spatial tile size:", decoder.tile_size)
     print("Spatial tile overlap:", decoder.tile_overlap)
+    print("Spatial tile selection: automatic from latent resolution")
 
     gc.collect()
     torch.cuda.empty_cache()
