@@ -856,16 +856,19 @@ class TiledGGUFLinear:
                         f"Non-finite weight values in {self.name}"
                     )
 
-                # In ComfyUI, stage decoded CUDA weight tiles through
-                # the dynamic ModelPatcher's managed HostBuffer pool. Standalone
-                # inference retains the original ordinary-CPU staging path.
+                # In ComfyUI, stage every decoded weight tile (CPU and CUDA
+                # projections) through the dynamic ModelPatcher's managed
+                # HostBuffer pool. Standalone inference keeps its normal path.
                 patcher = getattr(self.gguf, "comfy_model_patcher", None)
-                if self.device.type == "cuda" and patcher is not None:
+                if patcher is not None:
                     host_tile_lease = patcher.stage_host_tile(weight_np)
-                    weight = host_tile_lease["tensor"].to(
-                        device=self.device,
-                        dtype=torch.float32,
-                    )
+                    if self.device.type == "cuda":
+                        weight = host_tile_lease["tensor"].to(
+                            device=self.device,
+                            dtype=torch.float32,
+                        )
+                    else:
+                        weight = host_tile_lease["tensor"]
                     # The decoded NumPy copy has now been transferred into
                     # ComfyUI's managed pinned HostBuffer; release it promptly.
                     del weight_np
