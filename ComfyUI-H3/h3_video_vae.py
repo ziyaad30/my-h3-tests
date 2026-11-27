@@ -17,7 +17,7 @@ import torch
 
 # The repository keeps the standalone LightVAE implementation beside the
 # ComfyUI-H3 custom-node directory.
-REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 LIGHTVAE_ROOT = REPOSITORY_ROOT / "lightvae_h3_standalone"
 MODEL_DIR = REPOSITORY_ROOT / "models" / "vae"
 DECODER_FILENAME = "lightvae-lite-h3-decoder.safetensors"
