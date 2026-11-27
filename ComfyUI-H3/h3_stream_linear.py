@@ -434,7 +434,9 @@ class GGUF:
 
         end = start + row_count * bytes_per_row
 
-        return bytes(self.mm[start:end])
+        # Return a zero-copy view over the read-only mmap. The OS manages
+        # mmap page residency; only the decoded tile is H3 host staging.
+        return memoryview(self.mm)[start:end]
 
     def close(self):
         if self.mm is not None:
@@ -837,8 +839,8 @@ class TiledGGUFLinear:
                     row_start,
                     rows,
                 )
-                raw_bytes = len(raw)
-                self.gguf.memory_stats.add_host(raw_bytes)
+                # raw is a memoryview into the mmap, not a copied host buffer.
+                raw_bytes = 0
 
                 weight_np = decode_weight_tile(
                     raw,
@@ -864,6 +866,12 @@ class TiledGGUFLinear:
                         device=self.device,
                         dtype=torch.float32,
                     )
+                    # The decoded NumPy copy has now been transferred into
+                    # ComfyUI's managed pinned HostBuffer; release it promptly.
+                    del weight_np
+                    weight_np = None
+                    self.gguf.memory_stats.remove_host(host_weight_bytes)
+                    host_weight_bytes = 0
                 else:
                     weight = torch.from_numpy(
                         np.ascontiguousarray(weight_np)
