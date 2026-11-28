@@ -816,6 +816,10 @@ class H3InferenceEngine:
                     f"Audio hidden after B{block_index + 1}",
                     hidden[audio_start:audio_end],
                 )
+                print_stats(
+                    f"Video hidden after B{block_index + 1}",
+                    hidden[video_start:video_end],
+                )
 
             completed_in_step = block_index + 1
             report_memory = completed_in_step % 5 == 0
@@ -867,16 +871,16 @@ class H3InferenceEngine:
         )
 
         target_hidden = hidden[audio_start:video_end]
-        print_stats(
-            "Audio hidden before head",
-            target_hidden[:self.layout["audio_count"]],
-        )
+        audio_count = self.layout["audio_count"]
+        video_count = self.layout["video_count"]
+        print_stats("Audio hidden before head", target_hidden[:audio_count])
+        print_stats("Video hidden before head", target_hidden[audio_count:audio_count + video_count])
         video_all, audio_all = self.output_heads(
             target_hidden,
             selected_final_modulation,
         )
 
-        audio_count = self.layout["audio_count"]
+        print_stats("Video output head raw", video_all[audio_count:])
         print_stats("Audio output head raw", audio_all[:audio_count])
         audio_prediction_rows = audio_all[:audio_count]
         video_prediction_rows = video_all[audio_count:]
@@ -895,6 +899,7 @@ class H3InferenceEngine:
             self.latent_w // 2,
         )
         audio_prediction = unpack_audio(audio_prediction_rows)
+        print_stats("Video prediction", video_prediction)
         print_stats("Audio prediction", audio_prediction)
 
         # H3OutputHeads returns the positive data-ward head values.
@@ -1025,6 +1030,30 @@ def sample(
     print_stats("Initial video noise", video_latent)
     print_stats("Initial audio noise", audio_latent)
 
+    # Cheap live-tensor invariants: catch patch packing/unpacking errors before
+    # spending 50 streamed transformer blocks per evaluation.
+    video_roundtrip = unpatchify_video(
+        patchify_video(video_latent), latent_t, latent_h // 2, latent_w // 2
+    )
+    audio_roundtrip = unpack_audio(pack_audio(audio_latent))
+    video_roundtrip_error = (video_roundtrip - video_latent).abs().max().item()
+    audio_roundtrip_error = (audio_roundtrip - audio_latent).abs().max().item()
+    require(video_roundtrip_error == 0.0,
+            f"Video patchify round-trip failed: max error {video_roundtrip_error}")
+    require(audio_roundtrip_error == 0.0,
+            f"Audio pack round-trip failed: max error {audio_roundtrip_error}")
+    print(
+        "[H3 diagnostics] Video patchify/unpatchify and audio pack/unpack: PASS "
+        f"(max errors {video_roundtrip_error:g}, {audio_roundtrip_error:g})",
+        flush=True,
+    )
+    require(bool(torch.all(video_sigmas[:-1] > video_sigmas[1:]).item()),
+            "Video sigma schedule is not strictly descending")
+    require(bool(torch.all(audio_sigmas[:-1] > audio_sigmas[1:]).item()),
+            "Audio sigma schedule is not strictly descending")
+    require(float(video_sigmas[-1]) == 0.0 and float(audio_sigmas[-1]) == 0.0,
+            "Video/audio sigma schedules must terminate at zero")
+
     old_video_denoised = None
     old_audio_denoised = None
     audio_carried = None
@@ -1046,6 +1075,13 @@ def sample(
             step_index=index + 1,
             total_steps=steps,
             progress_callback=progress_callback,
+        )
+
+        print(
+            "[H3 diagnostics] Prediction/latent std ratio: "
+            f"video={video_prediction.float().std().item() / max(video_latent.float().std().item(), 1e-12):.5f}, "
+            f"audio={audio_prediction.float().std().item() / max(audio_latent.float().std().item(), 1e-12):.5f}",
+            flush=True,
         )
 
         if sampler == "euler":
