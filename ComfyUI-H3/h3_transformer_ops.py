@@ -419,6 +419,23 @@ def streamed_attention(
 # H3 TRANSFORMER BLOCK
 # ============================================================
 
+def _print_residual_modality_stats(label, tensor, token_tags):
+    """Print compact branch statistics for video/audio tokens only."""
+    for modality_name, modality_id in (("video", VIDEO), ("audio", AUDIO)):
+        mask = token_tags == modality_id
+        if not bool(mask.any().item()):
+            continue
+        value = tensor[mask].detach().float()
+        rms = torch.sqrt(torch.mean(value.square())).item()
+        mean_abs = value.abs().mean().item()
+        max_abs = value.abs().max().item()
+        print(
+            f"[H3 residual] B{label} {modality_name:<5} "
+            f"rms={rms:.5g} mean_abs={mean_abs:.5g} max_abs={max_abs:.5g}",
+            flush=True,
+        )
+
+
 class H3TransformerBlock(torch.nn.Module):
     """
     One streamed H3 transformer block.
@@ -441,6 +458,7 @@ class H3TransformerBlock(torch.nn.Module):
         super().__init__()
         self.gguf = gguf
         self.block_index = int(block_index)
+        self.print_residual_diagnostics = False
 
         # TiledGGUFLinear expects a string for its device argument.
         self.device = torch.device(device)
@@ -779,6 +797,24 @@ class H3TransformerBlock(torch.nn.Module):
         # ATTENTION GATED RESIDUAL
         # ----------------------------------------------------
 
+        if self.print_residual_diagnostics:
+            token_tags = torch.remainder(adaln_indices, 3)
+            selected = modulation_table.index_select(0, adaln_indices)
+            attention_gate = selected[:, 2, :]
+            attention_contribution = attention_gate * attention_output
+            block_label = self.block_index + 1
+            _print_residual_modality_stats(
+                f"{block_label} attention_branch", attention_output, token_tags
+            )
+            _print_residual_modality_stats(
+                f"{block_label} attention_gate", attention_gate, token_tags
+            )
+            _print_residual_modality_stats(
+                f"{block_label} attention_contribution",
+                attention_contribution, token_tags
+            )
+            del selected, attention_gate, attention_contribution
+
         x = apply_adaln_gated_residual(
             x,
             attention_output,
@@ -789,6 +825,12 @@ class H3TransformerBlock(torch.nn.Module):
         )
 
         del attention_output
+
+        if self.print_residual_diagnostics:
+            _print_residual_modality_stats(
+                f"{self.block_index + 1} after_attention_residual",
+                x, token_tags
+            )
 
         # ----------------------------------------------------
         # MLP NORMALIZATION AND ADALN
@@ -859,6 +901,23 @@ class H3TransformerBlock(torch.nn.Module):
         # MLP GATED RESIDUAL
         # ----------------------------------------------------
 
+        if self.print_residual_diagnostics:
+            selected = modulation_table.index_select(0, adaln_indices)
+            mlp_gate = selected[:, 5, :]
+            mlp_contribution = mlp_gate * mlp_output
+            block_label = self.block_index + 1
+            _print_residual_modality_stats(
+                f"{block_label} mlp_branch", mlp_output, token_tags
+            )
+            _print_residual_modality_stats(
+                f"{block_label} mlp_gate", mlp_gate, token_tags
+            )
+            _print_residual_modality_stats(
+                f"{block_label} mlp_contribution",
+                mlp_contribution, token_tags
+            )
+            del selected, mlp_gate, mlp_contribution
+
         output = apply_adaln_gated_residual(
             x,
             mlp_output,
@@ -869,6 +928,12 @@ class H3TransformerBlock(torch.nn.Module):
         )
 
         del x, mlp_output, modulation_table, adaln_indices
+
+        if self.print_residual_diagnostics:
+            _print_residual_modality_stats(
+                f"{self.block_index + 1} after_mlp_residual",
+                output, token_tags
+            )
 
         check_finite("Transformer block output", output)
 
