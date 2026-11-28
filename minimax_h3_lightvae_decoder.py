@@ -363,6 +363,118 @@ def decode_video_latents(latents, output_dir, checkpoint=None, fps=24):
     torch.cuda.empty_cache()
     return {"frames_dir": frames_dir, "mp4_path": mp4_path if mp4_written else None, "frame_count": expected_frames}
 
+
+# ============================================================
+# SINGLE-IMAGE DECODING (MATCH COMFYUI H3 VIDEO VAE STILL PATH)
+# ============================================================
+
+@torch.inference_mode()
+def decode_single_image_latent(latents, output_path, checkpoint=None):
+    """
+    Decode one normalized H3 still-image latent to exactly one RGB image.
+
+    Input:
+        [1, 24, 1, H/16, W/16]
+
+    ComfyUI's H3 video VAE still path repeats the lone latent to a
+    five-token temporal block, decodes that block, and keeps only
+    frame index 3 (frame_pre_padding = 3 for clip_length=17 and
+    temporal scale 4). This mirrors that path with the standalone
+    streamed LightVAE-Lite decoder.
+    """
+    output_path = Path(output_path)
+    checkpoint = Path(checkpoint) if checkpoint is not None else CHECKPOINT
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU unavailable.")
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Decoder checkpoint not found: {checkpoint}")
+    if not isinstance(latents, torch.Tensor) or latents.ndim != 5:
+        raise ValueError("Expected image latent tensor [1,24,1,H,W].")
+    if tuple(latents.shape[:3]) != (1, 24, 1):
+        raise ValueError(
+            f"Expected one 24-channel image latent [1,24,1,H,W], got {tuple(latents.shape)}"
+        )
+    if not torch.isfinite(latents).all():
+        raise ValueError("Image latent contains NaN or Inf.")
+
+    # H3 native still path: ceil(17 / 4) = 5 latent tokens,
+    # with the first 3 decoded frames treated as temporal pre-padding.
+    still_repeat = 5
+    still_frame_index = 3
+    repeated_latents = latents.detach().to(
+        device="cpu", dtype=torch.float32
+    ).repeat(1, 1, still_repeat, 1, 1)
+
+    print("\n========== LIGHTVAE-LITE SINGLE-IMAGE DECODING ==========", flush=True)
+    print("GPU:", torch.cuda.get_device_name(0))
+    print("Decoder checkpoint:", checkpoint)
+    print("Input image latent:", tuple(latents.shape))
+    print("ComfyUI still-path repeat:", still_repeat)
+    print("Selected decoded frame:", still_frame_index)
+
+    decoder = Decoder(checkpoint=checkpoint)
+    decoder.eval()
+    decoder.requires_grad_(False)
+    decoder.to(device="cpu", dtype=DTYPE)
+    decoder.decoder.rope.materialize_buffer("cpu")
+    decoder.decoder.forward = types.MethodType(streaming_forward, decoder.decoder)
+    decoder._decode_clip = types.MethodType(streaming_decode_clip, decoder)
+
+    print("Retained decoder blocks:", decoder.config["kept_layers"])
+    print("Spatial tile size:", decoder.tile_size)
+    print("Spatial tile overlap:", decoder.tile_overlap)
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize(DEVICE)
+    torch.cuda.reset_peak_memory_stats(DEVICE)
+
+    print("\nDecoding repeated still latent block...", flush=True)
+    decoded_block = decoder._decode_spatial(repeated_latents)
+    expected_block_shape = (
+        1, 3, still_repeat * 4,
+        int(latents.shape[-2]) * 16,
+        int(latents.shape[-1]) * 16,
+    )
+    if tuple(decoded_block.shape) != expected_block_shape:
+        raise RuntimeError(
+            f"Decoder block shape {tuple(decoded_block.shape)}; expected {expected_block_shape}"
+        )
+
+    decoded = decoded_block[:, :, still_frame_index:still_frame_index + 1].float()
+    pixel_mean = decoded.new_tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1, 1)
+    pixel_std = decoded.new_tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1, 1)
+    decoded = (decoded * pixel_std + pixel_mean) * 2.0 - 1.0
+
+    expected_shape = (
+        1, 3, 1,
+        int(latents.shape[-2]) * 16,
+        int(latents.shape[-1]) * 16,
+    )
+    if tuple(decoded.shape) != expected_shape:
+        raise RuntimeError(
+            f"Single-image output shape {tuple(decoded.shape)}; expected {expected_shape}"
+        )
+    if not torch.isfinite(decoded).all():
+        raise RuntimeError("Decoded image contains NaN or Inf.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    image_tensor = decoded[0, :, 0].detach().float().cpu()
+    rgb = ((image_tensor.clamp(-1, 1) + 1.0) * 127.5).round()
+    rgb = rgb.to(torch.uint8).permute(1, 2, 0).contiguous().numpy()
+    Image.fromarray(rgb, mode="RGB").save(output_path)
+
+    print("Decoded image shape:", tuple(decoded.shape))
+    print("Decoded value range:", float(decoded.min()), float(decoded.max()))
+    print("Saved image:", output_path.resolve())
+    report_gpu_memory("GPU memory after single-image decoding")
+
+    del repeated_latents, decoded_block, decoded, image_tensor, rgb, decoder
+    gc.collect()
+    torch.cuda.empty_cache()
+    return output_path
+
 def main():
 
     if not CHECKPOINT.is_file():
