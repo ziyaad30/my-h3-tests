@@ -31,12 +31,12 @@ from minimax_h3_lightvae_decoder import (
 # ============================================================
 
 ROOT = Path(__file__).resolve().parent
-INPUT_IMAGE_PATH = ROOT / "input.png"
+INPUT_IMAGE_PATH = r"C:\Users\User\PycharmProjects\WAN_VIDEO\frames\Testing\last_frame.png"  # I like direct paths, not resolve crap
 OUTPUT_DIR = ROOT / "lightvae_roundtrip_test"
 
 # ComfyUI-style generation dimensions.
-WIDTH = 320
-HEIGHT = 320
+WIDTH = 448
+HEIGHT = 256
 
 # H3 accepts one still frame, or video lengths following 17*n + 5.
 # 5 is the shortest valid H3 video; 22 gives a more useful temporal test.
@@ -65,11 +65,11 @@ def validate_settings():
 
 
 def load_source_image():
-    if not INPUT_IMAGE_PATH.is_file():
-        raise FileNotFoundError(
-            f"Input image not found: {INPUT_IMAGE_PATH}\n"
-            "Place one image named input.png beside this script."
-        )
+    # if not INPUT_IMAGE_PATH.is_file():
+    #     raise FileNotFoundError(
+    #         f"Input image not found: {INPUT_IMAGE_PATH}\n"
+    #         "Place one image named input.png beside this script."
+    #     )
 
     with Image.open(INPUT_IMAGE_PATH) as source:
         image = source.convert("RGB")
@@ -122,7 +122,7 @@ def main():
     print("GPU:", torch.cuda.get_device_name(0))
     print("PyTorch:", torch.__version__)
     print("CUDA:", torch.version.cuda)
-    print("Input image:", INPUT_IMAGE_PATH.resolve())
+    # print("Input image:", INPUT_IMAGE_PATH.resolve())
     print("Requested width:", WIDTH)
     print("Requested height:", HEIGHT)
     print("Requested length:", LENGTH)
@@ -214,7 +214,7 @@ def main():
     reconstruction_metrics(source_image, all_frame_paths)
 
     print("\n========== ROUND TRIP COMPLETE ==========")
-    print("Input image:", INPUT_IMAGE_PATH.resolve())
+    # print("Input image:", INPUT_IMAGE_PATH.resolve())
     print("Latent:", latent_path.resolve())
     print("Batch items:", BATCH_SIZE)
     print("Frames per item:", LENGTH)
