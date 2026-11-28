@@ -421,7 +421,7 @@ def streamed_attention(
 
 def _print_residual_modality_stats(label, tensor, token_tags):
     """Print compact video/audio statistics without copying full token streams."""
-    chunk_size = 64
+    chunk_size = 256
     for modality_name, modality_id in (("video", VIDEO), ("audio", AUDIO)):
         sum_abs = None
         sum_sq = None
@@ -456,7 +456,7 @@ def _print_residual_gate_stats(
     branch_output, token_tags,
 ):
     """Stream gate/contribution statistics in small token chunks."""
-    chunk_size = 64
+    chunk_size = 256
     for modality_name, modality_id in (("video", VIDEO), ("audio", AUDIO)):
         gate_sum_abs = gate_sum_sq = gate_max_abs = None
         contribution_sum_abs = contribution_sum_sq = contribution_max_abs = None
