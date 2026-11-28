@@ -482,8 +482,14 @@ class H3InferenceEngine:
         fps: float = DEFAULT_FPS,
         trim_working_set: bool = False,
         trim_interval_blocks: int = 10,
+        print_tensor_stats: bool = False,
+        print_block_progress: bool = True,
+        print_memory_stats: bool = False,
     ):
         self.gguf = gguf
+        self.print_tensor_stats = bool(print_tensor_stats)
+        self.print_block_progress = bool(print_block_progress)
+        self.print_memory_stats = bool(print_memory_stats)
         if transformer_blocks is None or len(transformer_blocks) != NUM_BLOCKS:
             raise ValueError(
                 f"H3 requires {NUM_BLOCKS} registered transformer block modules."
@@ -547,7 +553,7 @@ class H3InferenceEngine:
         condition_bias = read_checkpoint_vector(gguf, "condition_proj.bias").float()
         text = condition_projection(text_states.float().cpu()) + condition_bias
         del condition_projection, condition_bias
-        print_stats("Condition projection", text)
+        self._stats("Condition projection", text)
 
         print("\nRunning the two checkpoint token-refiner blocks...")
         for refiner_index in range(2):
@@ -567,7 +573,7 @@ class H3InferenceEngine:
         ).float()
         self.text_embed = rms_norm(text, final_refiner_norm).contiguous()
         del text, final_refiner_norm
-        print_stats("Refined text", self.text_embed)
+        self._stats("Refined text", self.text_embed)
 
         # Keyframe rows are fixed context. Encode and project them once;
         # they are never updated by the sampler.
@@ -609,6 +615,10 @@ class H3InferenceEngine:
         for start, end, kind in self.layout["segments"]:
             print(f"  {kind:<6} [{start:>6}, {end:>6})  rows={end-start}")
         print("  total sequence rows:", self.layout["seq_len"])
+
+    def _stats(self, name: str, tensor: torch.Tensor) -> None:
+        if self.print_tensor_stats:
+            print_stats(name, tensor)
 
     def _build_timestep_indices(
         self,
@@ -700,12 +710,12 @@ class H3InferenceEngine:
         video_rows = patchify_video(video_latent)
         audio_rows = pack_audio(audio_latent)
 
-        print_stats("Audio latent entering", audio_latent)
-        print_stats("Audio packed rows", audio_rows)
+        self._stats("Audio latent entering", audio_latent)
+        self._stats("Audio packed rows", audio_rows)
 
         video_embed = self.video_projection(video_rows)
         audio_embed = self.audio_projection(audio_rows)
-        print_stats("Audio patch embedding", audio_embed)
+        self._stats("Audio patch embedding", audio_embed)
 
         hidden = torch.empty(
             self.layout["seq_len"],
@@ -804,7 +814,7 @@ class H3InferenceEngine:
                     total_steps * NUM_BLOCKS,
                 )
 
-            if block_index == 0 or (block_index + 1) % 5 == 0:
+            if self.print_block_progress and (block_index == 0 or (block_index + 1) % 5 == 0):
                 print(
                     f"Step {step_index}/{total_steps} | "
                     f"Block {block_index + 1}/{NUM_BLOCKS}",
@@ -812,11 +822,11 @@ class H3InferenceEngine:
                 )
 
             if block_index in (0, 4, 9, 24, 49):
-                print_stats(
+                self._stats(
                     f"Audio hidden after B{block_index + 1}",
                     hidden[audio_start:audio_end],
                 )
-                print_stats(
+                self._stats(
                     f"Video hidden after B{block_index + 1}",
                     hidden[video_start:video_end],
                 )
@@ -848,7 +858,7 @@ class H3InferenceEngine:
                         flush=True,
                     )
 
-            if report_memory or trim_now:
+            if self.print_memory_stats and (report_memory or trim_now):
                 memory_label = (
                     f"step {step_index}/{total_steps} | "
                     f"after transformer block {completed_in_step}/{NUM_BLOCKS}"
@@ -857,7 +867,8 @@ class H3InferenceEngine:
                 report_cuda_memory(f"CUDA MEMORY: {memory_label}")
 
         transformer_elapsed = time.perf_counter() - start_time
-        print(f"50-block transformer elapsed: {transformer_elapsed:.2f}s")
+        if self.print_block_progress:
+            print(f"50-block transformer elapsed: {transformer_elapsed:.2f}s")
 
         # The final layer is applied only to the target audio+video rows.
         # The packed target order is audio first, video second.
@@ -873,15 +884,15 @@ class H3InferenceEngine:
         target_hidden = hidden[audio_start:video_end]
         audio_count = self.layout["audio_count"]
         video_count = self.layout["video_count"]
-        print_stats("Audio hidden before head", target_hidden[:audio_count])
-        print_stats("Video hidden before head", target_hidden[audio_count:audio_count + video_count])
+        self._stats("Audio hidden before head", target_hidden[:audio_count])
+        self._stats("Video hidden before head", target_hidden[audio_count:audio_count + video_count])
         video_all, audio_all = self.output_heads(
             target_hidden,
             selected_final_modulation,
         )
 
-        print_stats("Video output head raw", video_all[audio_count:])
-        print_stats("Audio output head raw", audio_all[:audio_count])
+        self._stats("Video output head raw", video_all[audio_count:])
+        self._stats("Audio output head raw", audio_all[:audio_count])
         audio_prediction_rows = audio_all[:audio_count]
         video_prediction_rows = video_all[audio_count:]
 
@@ -899,8 +910,8 @@ class H3InferenceEngine:
             self.latent_w // 2,
         )
         audio_prediction = unpack_audio(audio_prediction_rows)
-        print_stats("Video prediction", video_prediction)
-        print_stats("Audio prediction", audio_prediction)
+        self._stats("Video prediction", video_prediction)
+        self._stats("Audio prediction", audio_prediction)
 
         # H3OutputHeads returns the positive data-ward head values.
         # ComfyUI negates these before CONST.calculate_denoised (x - sigma*v).
@@ -986,6 +997,8 @@ def sample(
     audio_shift: float = AUDIO_SHIFT,
     progress_callback=None,
     sampler: str = "euler",
+    print_sampler_diagnostics: bool = False,
+    print_tensor_stats: bool = False,
 ):
     if sampler not in ("euler", "res_multistep"):
         raise ValueError(f"Unsupported H3 sampler: {sampler!r}")
@@ -1027,8 +1040,9 @@ def sample(
     if sampler == "res_multistep":
         print("Video sigma grid:", video_sigmas.tolist())
         print("Audio sigma grid:", audio_sigmas.tolist())
-    print_stats("Initial video noise", video_latent)
-    print_stats("Initial audio noise", audio_latent)
+    if print_tensor_stats:
+        print_stats("Initial video noise", video_latent)
+        print_stats("Initial audio noise", audio_latent)
 
     # Cheap live-tensor invariants: catch patch packing/unpacking errors before
     # spending 50 streamed transformer blocks per evaluation.
@@ -1042,11 +1056,12 @@ def sample(
             f"Video patchify round-trip failed: max error {video_roundtrip_error}")
     require(audio_roundtrip_error == 0.0,
             f"Audio pack round-trip failed: max error {audio_roundtrip_error}")
-    print(
-        "[H3 diagnostics] Video patchify/unpatchify and audio pack/unpack: PASS "
-        f"(max errors {video_roundtrip_error:g}, {audio_roundtrip_error:g})",
-        flush=True,
-    )
+    if print_sampler_diagnostics:
+        print(
+            "[H3 diagnostics] Video patchify/unpatchify and audio pack/unpack: PASS "
+            f"(max errors {video_roundtrip_error:g}, {audio_roundtrip_error:g})",
+            flush=True,
+        )
     require(bool(torch.all(video_sigmas[:-1] > video_sigmas[1:]).item()),
             "Video sigma schedule is not strictly descending")
     require(bool(torch.all(audio_sigmas[:-1] > audio_sigmas[1:]).item()),
@@ -1077,12 +1092,13 @@ def sample(
             progress_callback=progress_callback,
         )
 
-        print(
-            "[H3 diagnostics] Prediction/latent std ratio: "
-            f"video={video_prediction.float().std().item() / max(video_latent.float().std().item(), 1e-12):.5f}, "
-            f"audio={audio_prediction.float().std().item() / max(audio_latent.float().std().item(), 1e-12):.5f}",
-            flush=True,
-        )
+        if print_sampler_diagnostics:
+            print(
+                "[H3 diagnostics] Prediction/latent std ratio: "
+                f"video={video_prediction.float().std().item() / max(video_latent.float().std().item(), 1e-12):.5f}, "
+                f"audio={audio_prediction.float().std().item() / max(audio_latent.float().std().item(), 1e-12):.5f}",
+                flush=True,
+            )
 
         if sampler == "euler":
             video_latent = video_scheduler.step(video_prediction, video_timesteps[index], video_latent).prev_sample
@@ -1116,11 +1132,11 @@ def sample(
                 audio_latent = (audio_next_carried * (sigma_a_next / sigma_v_next)).to(audio_latent.dtype)
             audio_carried = audio_next_carried
 
-        print_stats("Audio latent after step", audio_latent)
         require(bool(torch.isfinite(video_latent).all().item()), f"Video latent became non-finite at step {index + 1}")
         require(bool(torch.isfinite(audio_latent).all().item()), f"Audio latent became non-finite at step {index + 1}")
-        print_stats("Updated video latent", video_latent)
-        print_stats("Updated audio latent", audio_latent)
+        if print_tensor_stats:
+            print_stats("Updated video latent", video_latent)
+            print_stats("Updated audio latent", audio_latent)
         del video_prediction, audio_prediction
         gc.collect()
 
