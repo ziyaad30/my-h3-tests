@@ -39,7 +39,7 @@ WIDTH = 320
 HEIGHT = 320
 
 # H3 accepts one still frame, or video lengths following 17*n + 5.
-# 22 is the smallest useful multi-frame video test.
+# 5 is the shortest valid H3 video; 22 gives a more useful temporal test.
 LENGTH = 22
 
 # Process one item at a time by default to protect 4 GB VRAM.
