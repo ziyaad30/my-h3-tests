@@ -6,7 +6,7 @@ import math
 import time
 import numpy as np
 import torch
-from .h3_stream_linear import DEFAULT_GGUF, GGUF, TiledGGUFLinear
+from .h3_stream_linear import DEFAULT_GGUF, GGUF, TiledGGUFLinear, TYPE_Q2_K, TYPE_Q3_K
 from .h3_adaln import StreamingAdaLN, VIDEO, TEXT, AUDIO
 from .h3_transformer_ops import (
     H3TransformerBlock, H3TokenRefiner, H3PatchProjection, H3OutputHeads,
@@ -450,6 +450,38 @@ def validate_checkpoint(gguf: GGUF) -> None:
         preview = "\n".join("  " + name for name in missing[:30])
         raise KeyError(
             f"Checkpoint is missing {len(missing)} required tensors:\n{preview}"
+        )
+
+    core_matrix_names = [
+        f"blocks.{index}.{suffix}"
+        for index in range(NUM_BLOCKS)
+        for suffix in (
+            "attn.qkv_proj.weight",
+            "attn.out_proj.weight",
+            "mlp.fc1.weight",
+            "mlp.fc2.weight",
+        )
+    ]
+    q2k_core = [
+        name for name in core_matrix_names
+        if gguf.tensors[name].ggml_type == TYPE_Q2_K
+    ]
+    q3k_core = [
+        name for name in core_matrix_names
+        if gguf.tensors[name].ggml_type == TYPE_Q3_K
+    ]
+    if q2k_core:
+        print(
+            "[H3 checkpoint warning] "
+            f"{len(q2k_core)}/{len(core_matrix_names)} core block matrices use Q2_K. "
+            "This very-low-bit H3 quantization is documented to produce broken video/audio. "
+            "Use Q3_K or a higher-quality quantization when possible; streamed Q3_K is supported.",
+            flush=True,
+        )
+    elif q3k_core:
+        print(
+            f"[H3 checkpoint] {len(q3k_core)}/{len(core_matrix_names)} core block matrices use Q3_K.",
+            flush=True,
         )
 
     inv_freq = read_checkpoint_vector(gguf, "rope.inv_freq")
