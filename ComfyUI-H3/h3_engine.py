@@ -924,6 +924,50 @@ class H3InferenceEngine:
 # Joint video/audio flow sampling
 # ---------------------------------------------------------------------------
 
+def _h3_simple_sigmas(shift: float, steps: int) -> torch.Tensor:
+    """Unsloth reference 1000-entry shifted sigma table, sampled at H3 step indices."""
+    if steps < 1:
+        raise ValueError("steps must be at least one")
+    table_size = 1000
+    base = torch.arange(1, table_size + 1, dtype=torch.float32) / table_size
+    table = float(shift) * base / (1.0 + (float(shift) - 1.0) * base)
+    stride = table_size / int(steps)
+    values = [float(table[-(1 + int(index * stride))]) for index in range(int(steps))] + [0.0]
+    return torch.tensor(values, dtype=torch.float32, device="cpu")
+
+
+def _h3_res_multistep_coefficients(sigmas: torch.Tensor, index: int):
+    """Second-order RES coefficients; None denotes the reference Euler boundary steps."""
+    sigma_next = sigmas[index + 1]
+    if index == 0 or float(sigma_next) == 0.0:
+        return None
+    t_fn = lambda value: value.log().neg()
+    phi1_fn = lambda value: torch.expm1(value) / value
+    phi2_fn = lambda value: (phi1_fn(value) - 1.0) / value
+    t = t_fn(sigmas[index])
+    t_old = t
+    t_next = t_fn(sigma_next)
+    t_prev = t_fn(sigmas[index - 1])
+    h = t_next - t
+    c2 = (t_prev - t_old) / h
+    phi1_value = phi1_fn(-h)
+    phi2_value = phi2_fn(-h)
+    b1 = torch.nan_to_num(phi1_value - phi2_value / c2, nan=0.0)
+    b2 = torch.nan_to_num(phi2_value / c2, nan=0.0)
+    return h, b1, b2
+
+
+def _h3_res_multistep_update(sample, denoised, old_denoised, sigmas, index):
+    coefficients = None if old_denoised is None else _h3_res_multistep_coefficients(sigmas, index)
+    sigma = sigmas[index]
+    sigma_next = sigmas[index + 1]
+    if coefficients is None:
+        derivative = (sample - denoised) / sigma
+        return sample + derivative * (sigma_next - sigma)
+    h, b1, b2 = coefficients
+    return (-h).exp() * sample + h * (b1 * denoised + b2 * old_denoised)
+
+
 @torch.inference_mode()
 def sample(
     engine: H3InferenceEngine,
@@ -936,36 +980,37 @@ def sample(
     video_shift: float = VIDEO_SHIFT,
     audio_shift: float = AUDIO_SHIFT,
     progress_callback=None,
+    sampler: str = "euler",
 ):
-    video_scheduler = H3FlowScheduler(shift=video_shift)
-    audio_scheduler = H3FlowScheduler(shift=audio_shift)
+    if sampler not in ("euler", "res_multistep"):
+        raise ValueError(f"Unsupported H3 sampler: {sampler!r}")
+    if sampler == "res_multistep":
+        video_sigmas = _h3_simple_sigmas(video_shift, steps)
+        audio_model_sigmas = time_shift_sigma(video_sigmas[:-1].numpy(), video_shift, audio_shift)
+        audio_sigmas = torch.cat((
+            torch.from_numpy(np.asarray(audio_model_sigmas, dtype=np.float32)),
+            torch.zeros(1, dtype=torch.float32),
+        ))
+        video_timesteps = 1.0 - video_sigmas[:-1]
+        audio_timesteps = 1.0 - audio_sigmas[:-1]
+    else:
+        video_scheduler = H3FlowScheduler(shift=video_shift)
+        audio_scheduler = H3FlowScheduler(shift=audio_shift)
+        video_scheduler.set_timesteps(steps + 1, device="cpu")
+        audio_scheduler.set_timesteps(steps + 1, device="cpu")
+        video_sigmas = video_scheduler.sigmas
+        audio_sigmas = audio_scheduler.sigmas
+        video_timesteps = video_scheduler.timesteps
+        audio_timesteps = audio_scheduler.timesteps
 
-    # set_timesteps receives sigma points, so steps+1 points produce
-    # exactly the requested number of model evaluations.
-    video_scheduler.set_timesteps(steps + 1, device="cpu")
-    audio_scheduler.set_timesteps(steps + 1, device="cpu")
-
-    require(video_scheduler.num_inference_steps == steps,
-            "Video scheduler evaluation count mismatch")
-    require(audio_scheduler.num_inference_steps == steps,
-            "Audio scheduler evaluation count mismatch")
-
+    require(video_sigmas.numel() == steps + 1, "Video scheduler evaluation count mismatch")
+    require(audio_sigmas.numel() == steps + 1, "Audio scheduler evaluation count mismatch")
     generator = torch.Generator(device="cpu").manual_seed(seed)
-
-    video_latent = torch.randn(
-        (1, 24, latent_t, latent_h, latent_w),
-        generator=generator,
-        dtype=torch.float32,
-        device="cpu",
-    )
-    audio_latent = torch.randn(
-        (1, 32, 2, audio_t),
-        generator=generator,
-        dtype=torch.float32,
-        device="cpu",
-    )
+    video_latent = torch.randn((1, 24, latent_t, latent_h, latent_w), generator=generator, dtype=torch.float32, device="cpu")
+    audio_latent = torch.randn((1, 32, 2, audio_t), generator=generator, dtype=torch.float32, device="cpu")
 
     print("\n========== JOINT H3 FL2VA DENOISING ==========")
+    print("Sampler:", sampler)
     print("Video latent:", tuple(video_latent.shape))
     print("Audio latent:", tuple(audio_latent.shape))
     print("Evaluations:", steps)
@@ -974,29 +1019,25 @@ def sample(
     print("Video shift:", video_shift)
     print("Audio shift:", audio_shift)
     print("Seed:", seed)
+    if sampler == "res_multistep":
+        print("Video sigma grid:", video_sigmas.tolist())
+        print("Audio sigma grid:", audio_sigmas.tolist())
     print_stats("Initial video noise", video_latent)
     print_stats("Initial audio noise", audio_latent)
 
+    old_video_denoised = None
+    old_audio_denoised = None
+    audio_carried = None
+    audio_scale = float(video_shift) / float(audio_shift)
     start_time = time.perf_counter()
 
     for index in range(steps):
-        sigma_video = float(video_scheduler.sigmas[index].item())
-        sigma_audio = float(audio_scheduler.sigmas[index].item())
-
-        mapped_audio_sigma = time_shift_sigma(
-            sigma_video, video_shift, audio_shift
-        )
-        require(
-            abs(mapped_audio_sigma - sigma_audio) < 1e-6,
-            "Video/audio sigma schedules do not match the official H3 mapping: "
-            f"{mapped_audio_sigma} vs {sigma_audio}",
-        )
-
-        print(
-            f"\n========== DENOISING STEP {index + 1}/{steps} ==========",
-            flush=True,
-        )
-
+        sigma_video = float(video_sigmas[index].item())
+        sigma_audio = float(audio_sigmas[index].item())
+        mapped_audio_sigma = time_shift_sigma(sigma_video, video_shift, audio_shift)
+        require(abs(float(mapped_audio_sigma) - sigma_audio) < 1e-6,
+                "Video/audio sigma schedules do not match the H3 mapping")
+        print(f"\n========== DENOISING STEP {index + 1}/{steps} ==========", flush=True)
         video_prediction, audio_prediction = engine.forward(
             video_latent=video_latent,
             audio_latent=audio_latent,
@@ -1007,35 +1048,46 @@ def sample(
             progress_callback=progress_callback,
         )
 
-        video_latent = video_scheduler.step(
-            video_prediction,
-            video_scheduler.timesteps[index],
-            video_latent,
-        ).prev_sample
+        if sampler == "euler":
+            video_latent = video_scheduler.step(video_prediction, video_timesteps[index], video_latent).prev_sample
+            audio_latent = audio_scheduler.step(audio_prediction, audio_timesteps[index], audio_latent).prev_sample
+        else:
+            sigma_v = video_sigmas[index]
+            sigma_a = audio_sigmas[index]
+            x_video = video_latent.float()
+            video_denoised = x_video + video_prediction.float() * sigma_v
+            video_latent = _h3_res_multistep_update(
+                x_video, video_denoised, old_video_denoised, video_sigmas, index
+            ).to(video_latent.dtype)
+            old_video_denoised = video_denoised
 
-        audio_latent = audio_scheduler.step(
-            audio_prediction,
-            audio_scheduler.timesteps[index],
-            audio_latent,
-        ).prev_sample
+            x_audio = audio_latent.float()
+            if audio_carried is None or index == 0 or audio_carried.shape != x_audio.shape:
+                audio_carried = x_audio * (sigma_v / sigma_a)
+            dy = (1.0 - audio_scale) * x_audio + (
+                1.0 + (audio_scale - 1.0) * sigma_a
+            ) * audio_prediction.float().neg()
+            audio_denoised = audio_carried - dy * sigma_v
+            audio_next_carried = _h3_res_multistep_update(
+                audio_carried, audio_denoised, old_audio_denoised, video_sigmas, index
+            )
+            old_audio_denoised = audio_denoised
+            sigma_v_next = video_sigmas[index + 1]
+            sigma_a_next = audio_sigmas[index + 1]
+            if float(sigma_v_next) == 0.0:
+                audio_latent = (audio_next_carried / audio_scale).to(audio_latent.dtype)
+            else:
+                audio_latent = (audio_next_carried * (sigma_a_next / sigma_v_next)).to(audio_latent.dtype)
+            audio_carried = audio_next_carried
 
         print_stats("Audio latent after step", audio_latent)
-
-        require(bool(torch.isfinite(video_latent).all().item()),
-                f"Video latent became non-finite at step {index + 1}")
-        require(bool(torch.isfinite(audio_latent).all().item()),
-                f"Audio latent became non-finite at step {index + 1}")
-
+        require(bool(torch.isfinite(video_latent).all().item()), f"Video latent became non-finite at step {index + 1}")
+        require(bool(torch.isfinite(audio_latent).all().item()), f"Audio latent became non-finite at step {index + 1}")
         print_stats("Updated video latent", video_latent)
         print_stats("Updated audio latent", audio_latent)
-
         del video_prediction, audio_prediction
         gc.collect()
 
     elapsed = time.perf_counter() - start_time
     print(f"\nJoint denoising elapsed: {elapsed:.2f}s")
-
-    return video_latent, audio_latent, elapsed, video_scheduler, audio_scheduler
-
-
-# ---------------------------------------------------------------------------
+    return video_latent, audio_latent, elapsed, None, None
