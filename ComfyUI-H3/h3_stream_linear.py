@@ -824,6 +824,67 @@ def test_q3k_decoder():
     print("Q3_K reference/Numba decoder parity: PASSED")
 
 
+@torch.inference_mode()
+def _decode_q3k_torch(raw, row_count, input_width, device):
+    """Decode streamed Q3_K blocks on CUDA without staging expanded weights in host RAM."""
+    if input_width % Q3K_BLOCK_ELEMENTS:
+        raise ValueError(f"Q3_K input width is not block-aligned: {input_width}")
+
+    block_count = row_count * (input_width // Q3K_BLOCK_ELEMENTS)
+    raw_array = np.frombuffer(raw, dtype=np.uint8)
+    expected_bytes = block_count * Q3K_BLOCK_BYTES
+    if raw_array.size != expected_bytes:
+        raise ValueError(
+            f"Q3_K tile byte count mismatch: {raw_array.size} != {expected_bytes}"
+        )
+
+    packed = torch.from_numpy(raw_array.copy()).to(device=device)
+    blocks = packed.view(block_count, Q3K_BLOCK_BYTES)
+    hmask = blocks[:, :32].to(torch.int32)
+    quant = blocks[:, 32:96].to(torch.int32)
+    scale_bytes = blocks[:, 96:108].to(torch.int32)
+
+    low_scales = torch.cat(
+        (scale_bytes[:, :8] & 15, scale_bytes[:, :8] >> 4),
+        dim=1,
+    )
+    high_scales = torch.stack(
+        [
+            (scale_bytes[:, 8 + (i % 4)] >> (2 * (i // 4))) & 3
+            for i in range(16)
+        ],
+        dim=1,
+    )
+    scales = (low_scales | (high_scales << 4)).to(torch.float32) - 32.0
+
+    d = (
+        blocks[:, 108:110]
+        .contiguous()
+        .view(torch.float16)
+        .to(torch.float32)
+    )
+
+    decoded_parts = []
+    for chunk in range(2):
+        q_chunk = quant[:, chunk * 32:(chunk + 1) * 32]
+        for group in range(4):
+            shift = group * 2
+            mask = 1 << (chunk * 4 + group)
+            for half in range(2):
+                first = half * 16
+                last = first + 16
+                q_values = ((q_chunk[:, first:last] >> shift) & 3).to(torch.float32)
+                high_bit_present = (hmask[:, first:last] & mask) != 0
+                q_values = q_values - (~high_bit_present).to(torch.float32) * 4.0
+                scale_index = chunk * 8 + group * 2 + half
+                decoded_parts.append(
+                    d[:, None] * scales[:, scale_index:scale_index + 1] * q_values
+                )
+
+    decoded = torch.cat(decoded_parts, dim=1)
+    return decoded.reshape(row_count, input_width)
+
+
 # ============================================================
 # OTHER GGML WEIGHT DECODERS
 # ============================================================
@@ -1011,15 +1072,15 @@ class TiledGGUFLinear(torch.nn.Module):
                 # raw is a memoryview into the mmap, not a copied host buffer.
                 raw_bytes = 0
 
-                if self.ggml_type == TYPE_Q2_K and self.device.type == "cuda":
-                    # Decode the dominant quantized transformer weights on CUDA.
-                    # CPU projections retain the measured Numba decoder path.
-                    weight = _decode_q2k_torch(
-                        raw,
-                        rows,
-                        self.input_width,
-                        self.device,
-                    )
+                if self.device.type == "cuda" and self.ggml_type in (TYPE_Q2_K, TYPE_Q3_K):
+                    if self.ggml_type == TYPE_Q2_K:
+                        weight = _decode_q2k_torch(
+                            raw, rows, self.input_width, self.device
+                        )
+                    else:
+                        weight = _decode_q3k_torch(
+                            raw, rows, self.input_width, self.device
+                        )
                     vram_weight_bytes = weight.numel() * weight.element_size()
                     self.gguf.memory_stats.add_vram(vram_weight_bytes)
 
