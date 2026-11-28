@@ -421,8 +421,8 @@ def streamed_attention(
 
 def _print_tensor_summary(label, tensor):
     """Print scalar activation statistics using bounded temporary chunks."""
-    sum_abs = torch.zeros((), device=tensor.device, dtype=torch.float64)
-    sum_sq = torch.zeros((), device=tensor.device, dtype=torch.float64)
+    sum_abs = torch.zeros((), device=tensor.device, dtype=torch.float32)
+    sum_sq = torch.zeros((), device=tensor.device, dtype=torch.float32)
     maximum = torch.tensor(float("-inf"), device=tensor.device)
     minimum = torch.tensor(float("inf"), device=tensor.device)
     max_abs = torch.zeros((), device=tensor.device)
@@ -430,8 +430,8 @@ def _print_tensor_summary(label, tensor):
     chunk_rows = 8
     for first in range(0, tensor.shape[0], chunk_rows):
         value = tensor[first:first + chunk_rows].detach().float()
-        sum_abs += value.abs().sum(dtype=torch.float64)
-        sum_sq += value.square().sum(dtype=torch.float64)
+        sum_abs += value.abs().sum()
+        sum_sq += value.square().sum()
         maximum = torch.maximum(maximum, value.max())
         minimum = torch.minimum(minimum, value.min())
         max_abs = torch.maximum(max_abs, value.abs().max())
