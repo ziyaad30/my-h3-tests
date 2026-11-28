@@ -9,6 +9,7 @@ from __future__ import annotations
 import gc
 import logging
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -39,16 +40,25 @@ def _streaming_encode_clip(self, video):
     video = ((video + 1.0) / 2.0 - mean) / std
 
     device = self._h3_device
+    started = time.perf_counter()
+
+    def report(stage):
+        log.info("[LightVAE Encode] %s | %.1f sec elapsed", stage, time.perf_counter() - started)
+
     hidden_states = video.to(device=device, dtype=DTYPE)
+    report("Input staged on GPU")
 
     self.encoder.conv_in.to(device=device, dtype=DTYPE)
     try:
+        report("Initial convolution")
         hidden_states = self.encoder.conv_in(hidden_states)
     finally:
         self.encoder.conv_in.to(device="cpu")
 
-    for stage_index, down_block in enumerate(self.encoder.down_blocks):
-        for resnet_index, resnet in enumerate(down_block.resnets):
+    for stage_index, down_block in enumerate(self.encoder.down_blocks, start=1):
+        report(f"Down stage {stage_index}/{len(self.encoder.down_blocks)}")
+        for resnet_index, resnet in enumerate(down_block.resnets, start=1):
+            report(f"  Residual block {resnet_index}/{len(down_block.resnets)}")
             resnet.to(device=device, dtype=DTYPE)
             try:
                 hidden_states = resnet(hidden_states)
@@ -56,31 +66,36 @@ def _streaming_encode_clip(self, video):
                 resnet.to(device="cpu")
 
         if down_block.downsamplers is not None:
-            for downsampler in down_block.downsamplers:
+            for downsampler_index, downsampler in enumerate(down_block.downsamplers, start=1):
+                report(f"  Downsample {downsampler_index}/{len(down_block.downsamplers)}")
                 downsampler.to(device=device, dtype=DTYPE)
                 try:
                     hidden_states = downsampler(hidden_states)
                 finally:
                     downsampler.to(device="cpu")
 
+    report("Output normalization")
     self.encoder.norm_out.to(device=device, dtype=DTYPE)
     try:
         hidden_states = F.silu(self.encoder.norm_out(hidden_states))
     finally:
         self.encoder.norm_out.to(device="cpu")
 
+    report("Output convolution")
     self.encoder.conv_out.to(device=device, dtype=DTYPE)
     try:
         moments = self.encoder.conv_out(hidden_states)
     finally:
         self.encoder.conv_out.to(device="cpu")
 
+    report("Quantization convolution")
     self.quant_conv.to(device=device, dtype=DTYPE)
     try:
         moments = self.quant_conv(moments)
     finally:
         self.quant_conv.to(device="cpu")
 
+    report("Clip complete")
     return moments.to(device="cpu")
 
 
