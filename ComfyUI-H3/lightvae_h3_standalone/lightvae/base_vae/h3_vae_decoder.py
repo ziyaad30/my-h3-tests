@@ -326,12 +326,19 @@ class Decoder(H3Module):
     def forward(self, latents):
         if latents.ndim != 5 or latents.shape[1] != self.latent_channels:
             raise ValueError(f"H3 latents must have shape [B,{self.latent_channels},T,H,W]")
-        frames = h3_decoded_frames(latents.shape[2])
-        if latents.shape[2] == 2:
+        latent_frames = int(latents.shape[2])
+        frames = h3_decoded_frames(latent_frames)
+        if latent_frames == 1:
+            # Match ComfyUI's native MiniMaxH3VideoVAE still-image path:
+            # decode the one latent to its four temporal patch frames and
+            # retain the final frame. A single-image encode intentionally
+            # produces T=1; it is not part of the video 5*n+2 grid.
+            video = self._decode_spatial(latents)[:, :, -1:]
+        elif latent_frames == 2:
             video = self._decode_spatial(latents)[:, :, 3:8]
         else:
             output, previous = [], None
-            for begin in range(0, latents.shape[2] - 2, 5):
+            for begin in range(0, latent_frames - 2, 5):
                 raw = self._decode_spatial(latents[:, :, begin:begin + 7])
                 first, tail = raw[:, :, 3:20], raw[:, :, 23:28]
                 output.append(first if previous is None else blend(previous, first, 5, -3))
