@@ -771,6 +771,11 @@ class H3InferenceEngine:
             )
 
             block = self.transformer_blocks[block_index]
+            # Residual diagnostics are intentionally limited to selected
+            # checkpoints and are enabled by the existing tensor-stat toggle.
+            block.print_residual_diagnostics = (
+                self.print_tensor_stats and block_index in (0, 4, 9, 24, 49)
+            )
 
             # Stage only the active block's small norm buffers on CUDA.
             # Projection matrices remain mmap-backed and are decoded by row
