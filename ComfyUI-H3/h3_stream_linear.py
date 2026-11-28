@@ -861,7 +861,7 @@ def _decode_q3k_torch(raw, row_count, input_width, device):
         blocks[:, 108:110]
         .contiguous()
         .view(torch.float16)
-        .to(torch.float32)
+        .to(torch.float32)[:, 0]
     )
 
     decoded_parts = []
