@@ -1,8 +1,8 @@
 """Beta native-ComfyUI H3 video VAE decoder.
 
-Uses the loaded ComfyUI VAE and the H3 VAE's own spatial tiled decoder.
-During decoding, H3 decoder attention is temporarily routed through
-ComfyUI optimized_attention instead of the incompatible INT8 Sage kernel.
+Keeps the native H3 VAE decode path and routes decoder attention through
+ComfyUI optimized_attention. The tiled path also preserves global H3 rotary
+positions across spatial tiles and blends against already-composited neighbours.
 """
 from __future__ import annotations
 
@@ -18,6 +18,197 @@ def _h3_optimized_attention(self, query, key, value):
         query, key, value, self.heads, skip_reshape=True
     )
     return torch.nan_to_num(out)
+
+
+def _h3_create_token_ids(patch_dims, device, dtype, full_dims, offset):
+    """Build RoPE coordinates in the full latent grid, not tile-local space."""
+    coords_list = []
+    for dim_size, full_size, off in zip(patch_dims, full_dims, offset):
+        coords = torch.arange(
+            0.5, dim_size, dtype=dtype, device=device
+        ) + off
+        coords = coords / full_size
+        coords = 2.0 * coords - 1.0
+        coords_list.append(coords)
+    coords = torch.stack(
+        torch.meshgrid(*coords_list, indexing="ij"), dim=-1
+    )
+    return coords.flatten(0, len(patch_dims) - 1).unsqueeze(0)
+
+
+def _h3_position_aware_decoder_forward(
+    self, x, full_dims=None, offsets=None
+):
+    """Native ViT3D decoder forward with global coordinates for each tile."""
+    import comfy.ops
+
+    batch, channels, latent_t, latent_h, latent_w = x.shape
+    hidden = self.x_embedder(x.flatten(2).transpose(1, 2))
+    num_patches = hidden.shape[1]
+    num_suffix = 1 + self.num_register_tokens
+
+    register_tokens = comfy.ops.cast_to_input(
+        self.register_tokens, hidden
+    ).expand(batch, -1, -1)
+    hidden = torch.cat(
+        [hidden, register_tokens, torch.zeros_like(hidden[:, 0:1, :])],
+        dim=1,
+    )
+
+    patch_dims = (latent_t, latent_h, latent_w)
+    if full_dims is None:
+        full_dims = patch_dims
+    if offsets is None:
+        offsets = (0, 0, 0)
+    if isinstance(offsets, tuple):
+        offsets = [offsets]
+
+    if batch % len(offsets):
+        raise ValueError(
+            "Tile offset count must divide the decoder batch size."
+        )
+    per_offset_batch = batch // len(offsets)
+    img_ids = torch.cat(
+        [
+            _h3_create_token_ids(
+                patch_dims, x.device, x.dtype, full_dims, offset
+            ).expand(per_offset_batch, -1, -1)
+            for offset in offsets
+        ],
+        dim=0,
+    )
+    suffix_ids = torch.zeros(
+        (batch, num_suffix, self.pos_embed.n_dim),
+        device=x.device,
+        dtype=img_ids.dtype,
+    )
+    img_ids = torch.cat([img_ids, suffix_ids], dim=1)
+    rotary_pos_emb = self.pos_embed(img_ids)
+
+    for block in self.transformer_blocks:
+        hidden = block(hidden, rotary_pos_emb)
+
+    output = self.proj_out(self.norm_out(hidden))[:, :num_patches, :]
+    output = output.view(
+        batch,
+        latent_t,
+        latent_h,
+        latent_w,
+        self.out_channels,
+        self.patch_size_t,
+        self.patch_size,
+        self.patch_size,
+    )
+    output = output.permute(0, 4, 1, 5, 2, 6, 3, 7).contiguous()
+    return output.reshape(
+        batch,
+        self.out_channels,
+        latent_t * self.patch_size_t,
+        latent_h * self.patch_size,
+        latent_w * self.patch_size,
+    )
+
+
+def _h3_position_aware_decode_pixels(
+    self, latents, full_dims, offsets
+):
+    decoded_latents = self.post_quant_conv(latents)
+    return self.decoder(
+        decoded_latents, full_dims=full_dims, offsets=offsets
+    )
+
+
+def _h3_tiled_decode(self, z, frames=slice(None)):
+    """H3 spatial tiling with global RoPE coordinates and continuous blending.
+
+    The row strip and left tail are captured after the preceding blend. This
+    prevents overlap intersections from blending against stale raw tile pixels.
+    """
+    ratio = int(self.vae_ratio)
+    height = int(z.shape[-2]) * ratio
+    width = int(z.shape[-1]) * ratio
+    full_dims = (int(z.shape[-3]), int(z.shape[-2]), int(z.shape[-1]))
+
+    y_idx, y_len, y_overlap = self.split_tiles(height)
+    x_idx, x_len, x_overlap = self.split_tiles(width)
+
+    canvas = None
+    strip = None
+    out_y = 0
+
+    for i, (i_pos, i_len) in enumerate(zip(y_idx, y_len)):
+        zi = i_pos // ratio
+        zl = i_len // ratio
+        new_strip = None
+        left_tail = None
+        out_x = 0
+        tile_height = 0
+
+        for j, (j_pos, j_len) in enumerate(zip(x_idx, x_len)):
+            zj = j_pos // ratio
+            zw = j_len // ratio
+            tile_latent = z[..., zi:zi + zl, zj:zj + zw]
+            tile = self._decode_pixels(
+                tile_latent,
+                full_dims=full_dims,
+                offsets=(0, zi, zj),
+            )[:, :, frames]
+
+            if i > 0:
+                previous_row = strip[..., :, x_idx[j]:x_idx[j] + x_len[j]]
+                tile = self.blend(
+                    previous_row, tile, y_overlap[i - 1], dim=-2
+                )
+            if j > 0:
+                tile = self.blend(
+                    left_tail, tile, x_overlap[j - 1], dim=-1
+                )
+
+            left_tail = (
+                tile[..., :, -x_overlap[j]:].clone()
+                if j < len(x_idx) - 1
+                else None
+            )
+            if j < len(x_idx) - 1:
+                tile = tile[..., :, :-x_overlap[j]]
+
+            if canvas is None:
+                canvas = torch.empty(
+                    *tile.shape[:-2],
+                    height,
+                    width,
+                    dtype=tile.dtype,
+                    device=tile.device,
+                )
+
+            if i < len(y_idx) - 1:
+                if new_strip is None:
+                    new_strip = torch.empty(
+                        *tile.shape[:-2],
+                        y_overlap[i],
+                        width,
+                        dtype=tile.dtype,
+                        device=tile.device,
+                    )
+                new_strip[
+                    ..., :, out_x:out_x + tile.shape[-1]
+                ] = tile[..., -y_overlap[i]:, :]
+                tile = tile[..., :-y_overlap[i], :]
+
+            canvas[
+                ..., out_y:out_y + tile.shape[-2],
+                out_x:out_x + tile.shape[-1]
+            ].copy_(tile)
+            tile_height = tile.shape[-2]
+            out_x += tile.shape[-1]
+            del tile, tile_latent
+
+        strip = new_strip
+        out_y += tile_height
+
+    if canvas is None:
+        raise RuntimeError("H3 tiled decoder produced no spatial tiles.")
+    return canvas
 
 
 class H3VideoVAEDecodeBeta:
@@ -76,9 +267,25 @@ class H3VideoVAEDecodeBeta:
                 "The supplied VAE does not expose "
                 "decoder.transformer_blocks from the native H3 VAE."
             )
+        if not all(
+            hasattr(decoder, name)
+            for name in (
+                "x_embedder", "register_tokens", "pos_embed",
+                "num_register_tokens", "patch_size", "patch_size_t",
+                "out_channels", "norm_out", "proj_out",
+            )
+        ):
+            raise TypeError(
+                "The loaded H3 decoder does not expose the expected "
+                "ComfyUI ViT3D decoder interface."
+            )
+        if not callable(getattr(first_stage, "_decode_pixels", None)):
+            raise TypeError("The loaded H3 VAE is missing _decode_pixels().")
+        if not callable(getattr(first_stage, "split_tiles", None)):
+            raise TypeError("The loaded H3 VAE is missing split_tiles().")
+        if not callable(getattr(first_stage, "blend", None)):
+            raise TypeError("The loaded H3 VAE is missing blend().")
 
-        # These are the actual controls used by MiniMaxH3VideoVAE._adaptive_decode
-        # and tiled_decode. tile_size/overlap are in decoded pixel-space units.
         ratio = int(getattr(first_stage, "vae_ratio", 16))
         if tile_size % ratio:
             raise ValueError(
@@ -98,11 +305,19 @@ class H3VideoVAEDecodeBeta:
             ("tile_overlap_min", int(tile_overlap)),
         ):
             if not hasattr(first_stage, name):
-                raise TypeError(f"Loaded H3 VAE is missing expected setting {name!r}.")
+                raise TypeError(
+                    f"Loaded H3 VAE is missing expected setting {name!r}."
+                )
             settings[name] = getattr(first_stage, name)
 
-        patched = []
-        images = None
+        def install_method(obj, name, function):
+            had_override = name in obj.__dict__
+            previous_override = obj.__dict__.get(name)
+            setattr(obj, name, types.MethodType(function, obj))
+            return (obj, name, had_override, previous_override)
+
+        patched_methods = []
+        patched_attention = []
         try:
             for block in blocks:
                 attention = getattr(block, "attn", None)
@@ -117,10 +332,29 @@ class H3VideoVAEDecodeBeta:
                 attention.attention = types.MethodType(
                     _h3_optimized_attention, attention
                 )
-                patched.append((attention, had_override, previous_override))
+                patched_attention.append(
+                    (attention, had_override, previous_override)
+                )
 
-            if not patched:
-                raise RuntimeError("No compatible H3 decoder attention methods found.")
+            if not patched_attention:
+                raise RuntimeError(
+                    "No compatible H3 decoder attention methods found."
+                )
+
+            patched_methods.append(
+                install_method(
+                    decoder, "forward", _h3_position_aware_decoder_forward
+                )
+            )
+            patched_methods.append(
+                install_method(
+                    first_stage, "_decode_pixels",
+                    _h3_position_aware_decode_pixels,
+                )
+            )
+            patched_methods.append(
+                install_method(first_stage, "tiled_decode", _h3_tiled_decode)
+            )
 
             first_stage.tiling = bool(tiling)
             first_stage.tile_size = int(tile_size)
@@ -133,28 +367,35 @@ class H3VideoVAEDecodeBeta:
             )
             print(
                 "[H3 Video VAE BETA] Decoding "
-                f"{tuple(samples.shape)} with regular ComfyUI attention; "
-                f"patched {len(patched)} decoder blocks; {mode}. "
-                "Quantized decoder weights remain unchanged.",
+                f"{tuple(samples.shape)} with ComfyUI optimized_attention; "
+                f"patched {len(patched_attention)} decoder blocks; "
+                "global tile RoPE positions and composited overlap blending; "
+                f"{mode}.",
                 flush=True,
             )
 
-            # H3's own decode() calls _adaptive_decode(), which dispatches to
-            # tiled_decode() when first_stage.tiling is enabled. ComfyUI's VAE
-            # wrapper still manages model loading, offloading and output device.
             images = vae.decode(samples)
 
         finally:
             for name, value in settings.items():
                 setattr(first_stage, name, value)
-            for attention, had_override, previous_override in reversed(patched):
+
+            for obj, name, had_override, previous_override in reversed(
+                patched_methods
+            ):
+                if had_override:
+                    setattr(obj, name, previous_override)
+                else:
+                    delattr(obj, name)
+
+            for attention, had_override, previous_override in reversed(
+                patched_attention
+            ):
                 if had_override:
                     attention.attention = previous_override
                 else:
                     delattr(attention, "attention")
 
-        # ComfyUI's IMAGE type is [N,H,W,C]. H3 video decode returns
-        # [B,T,H,W,C]; flatten batch and time so Save Image receives 3D frames.
         if not isinstance(images, torch.Tensor) or images.ndim != 5:
             shape = (
                 tuple(images.shape)
@@ -179,7 +420,8 @@ class H3VideoVAEDecodeBeta:
 
         diagnostic = (
             "BETA decode completed with ComfyUI optimized_attention; "
-            f"patched {len(patched)} H3 attention blocks; "
+            f"patched {len(patched_attention)} H3 attention blocks; "
+            "global tile RoPE coordinates and composited overlap blending; "
             f"spatial tiling={'on' if tiling else 'off'}, "
             f"tile={tile_size}px, overlap={tile_overlap}px; "
             f"output={tuple(image_batch.shape)}. "
