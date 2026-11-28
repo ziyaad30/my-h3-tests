@@ -6,6 +6,8 @@ from .h3_sampler import H3Sampler
 from .h3_sampler_beta import H3SamplerBeta
 from .h3_lora import H3LoRALoader
 from .h3_video_vae import H3VideoVAELoader, H3VideoVAEDecode
+from .h3_video_vae_beta import H3VideoVAEDecodeBeta
+from .h3_size import H3Size
 
 NODE_CLASS_MAPPINGS = {
     "H3TextEncoder": H3TextEncoder,
@@ -16,6 +18,8 @@ NODE_CLASS_MAPPINGS = {
     "H3LoRALoader": H3LoRALoader,
     "H3VideoVAELoader": H3VideoVAELoader,
     "H3VideoVAEDecode": H3VideoVAEDecode,
+    "H3VideoVAEDecodeBeta": H3VideoVAEDecodeBeta,
+    "H3Size": H3Size,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -27,4 +31,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3LoRALoader": "H3 LoRA Loader",
     "H3VideoVAELoader": "H3 Video VAE",
     "H3VideoVAEDecode": "H3 Video VAE Decode",
+    "H3VideoVAEDecodeBeta": "H3 Video VAE Decode (BETA)",
+    "H3Size": "MiniMax H3 Size",
 }

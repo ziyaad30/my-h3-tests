@@ -69,6 +69,32 @@ def report_cuda_memory(label: str) -> None:
     print(f"CUDA peak alloc:{torch.cuda.max_memory_allocated() / mib:.2f} MiB")
     print(f"CUDA peak reserv:{torch.cuda.max_memory_reserved() / mib:.2f} MiB")
 
+def trim_process_working_set() -> None:
+    """Ask Windows to remove pageable pages from this process's working set."""
+    if __import__("os").name != "nt":
+        raise OSError("Windows working-set trimming is only available on Windows.")
+
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("Psapi.dll", use_last_error=True)
+
+    get_current_process = kernel32.GetCurrentProcess
+    get_current_process.argtypes = []
+    get_current_process.restype = wintypes.HANDLE
+
+    empty_working_set = psapi.EmptyWorkingSet
+    empty_working_set.argtypes = [wintypes.HANDLE]
+    empty_working_set.restype = wintypes.BOOL
+
+    if not empty_working_set(get_current_process()):
+        error_code = ctypes.get_last_error()
+        raise OSError(
+            error_code,
+            ctypes.FormatError(error_code).strip() or "EmptyWorkingSet failed",
+        )
+
+
 def report_system_memory(label: str) -> None:
     """Report Windows physical RAM and this process's resident working set."""
     print(f"\n========== SYSTEM RAM: {label} ==========", flush=True)
@@ -454,6 +480,8 @@ class H3InferenceEngine:
         lora: H3TurboLoRA | None = None,
         transformer_blocks: torch.nn.ModuleList | None = None,
         fps: float = DEFAULT_FPS,
+        trim_working_set: bool = False,
+        trim_interval_blocks: int = 10,
     ):
         self.gguf = gguf
         if transformer_blocks is None or len(transformer_blocks) != NUM_BLOCKS:
@@ -463,6 +491,18 @@ class H3InferenceEngine:
         self.transformer_blocks = transformer_blocks
         self.seed = int(seed)
         self.lora = lora
+        self.trim_working_set = bool(trim_working_set)
+        self.trim_interval_blocks = int(trim_interval_blocks)
+        if not 1 <= self.trim_interval_blocks <= NUM_BLOCKS:
+            raise ValueError(
+                f"RAM trim interval must be between 1 and {NUM_BLOCKS} blocks."
+            )
+        if self.trim_working_set:
+            print(
+                "[H3 RAM Trim] Enabled: request Windows working-set trimming "
+                f"every {self.trim_interval_blocks} transformer blocks.",
+                flush=True,
+            )
         # Do not preload all 50 adapters: only the active block's factors are
         # moved to the execution device, then released before the next block.
         for block in self.transformer_blocks:
@@ -777,15 +817,37 @@ class H3InferenceEngine:
                     hidden[audio_start:audio_end],
                 )
 
-            if (block_index + 1) % 5 == 0:
+            completed_in_step = block_index + 1
+            report_memory = completed_in_step % 5 == 0
+            if report_memory:
                 gc.collect()
                 torch.cuda.empty_cache()
 
-                # Sample memory after each five-block group has been
-                # cleaned up, so RAM growth can be compared across blocks.
+            trim_now = self.trim_working_set and (
+                completed_in_step % self.trim_interval_blocks == 0
+                or completed_in_step == NUM_BLOCKS
+            )
+            if trim_now:
+                try:
+                    trim_process_working_set()
+                    print(
+                        "[H3 RAM Trim] Windows working-set trim requested "
+                        f"after block {completed_in_step}/{NUM_BLOCKS}. "
+                        "Windows may retain file-backed pages in its system cache.",
+                        flush=True,
+                    )
+                except OSError as exc:
+                    self.trim_working_set = False
+                    print(
+                        "[H3 RAM Trim] Request failed; disabling further trims: "
+                        f"{exc}",
+                        flush=True,
+                    )
+
+            if report_memory or trim_now:
                 memory_label = (
                     f"step {step_index}/{total_steps} | "
-                    f"after transformer block {block_index + 1}/{NUM_BLOCKS}"
+                    f"after transformer block {completed_in_step}/{NUM_BLOCKS}"
                 )
                 report_system_memory(memory_label)
                 report_cuda_memory(f"CUDA MEMORY: {memory_label}")
