@@ -33,6 +33,10 @@ class H3SamplerResMultistep:
                 "video_shift": ("FLOAT", {"default": 12.0, "min": 0.01, "max": 100.0, "step": 0.01}),
                 "audio_shift": ("FLOAT", {"default": 3.0, "min": 0.01, "max": 100.0, "step": 0.01}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
+                "print_tensor_stats": ("BOOLEAN", {"default": False}),
+                "print_block_progress": ("BOOLEAN", {"default": True}),
+                "print_memory_stats": ("BOOLEAN", {"default": False}),
+                "print_sampler_diagnostics": ("BOOLEAN", {"default": False}),
             },
             "optional": {
                 "lora": ("H3_LORA",),
@@ -49,7 +53,9 @@ class H3SamplerResMultistep:
     def sample(
         self, model, conditioning, width, height, frames, fps, steps,
         trim_working_set, trim_interval_blocks,
-        video_shift, audio_shift, seed, lora=None
+        video_shift, audio_shift, seed, print_tensor_stats,
+        print_block_progress, print_memory_stats, print_sampler_diagnostics,
+        lora=None
     ):
         if not torch.cuda.is_available():
             raise RuntimeError("H3 sampling requires CUDA; no CUDA device is available.")
@@ -157,6 +163,10 @@ class H3SamplerResMultistep:
                 trim_interval_blocks=int(trim_interval_blocks),
                 progress_callback=update_progress,
                 sampler="res_multistep",
+                print_tensor_stats=bool(print_tensor_stats),
+                print_block_progress=bool(print_block_progress),
+                print_memory_stats=bool(print_memory_stats),
+                print_sampler_diagnostics=bool(print_sampler_diagnostics),
             )
             del text_states
             gc.collect()
