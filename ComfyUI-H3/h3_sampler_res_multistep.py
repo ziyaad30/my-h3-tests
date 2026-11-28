@@ -39,6 +39,8 @@ class H3SamplerResMultistep:
                 "print_sampler_diagnostics": ("BOOLEAN", {"default": False}),
             },
             "optional": {
+                "first_frame": ("IMAGE",),
+                "last_frame": ("IMAGE",),
                 "lora": ("H3_LORA",),
             },
         }
@@ -55,7 +57,7 @@ class H3SamplerResMultistep:
         trim_working_set, trim_interval_blocks,
         video_shift, audio_shift, seed, print_tensor_stats,
         print_block_progress, print_memory_stats, print_sampler_diagnostics,
-        lora=None
+        first_frame=None, last_frame=None, lora=None
     ):
         if not torch.cuda.is_available():
             raise RuntimeError("H3 sampling requires CUDA; no CUDA device is available.")
@@ -87,6 +89,8 @@ class H3SamplerResMultistep:
             raise ValueError("At least one denoising evaluation is required.")
         if video_shift <= 0 or audio_shift <= 0:
             raise ValueError("Video and audio shifts must both be positive.")
+        if not 1 <= int(trim_interval_blocks) <= NUM_BLOCKS:
+            raise ValueError(f"RAM trim interval must be between 1 and {NUM_BLOCKS} blocks.")
 
         if lora is None and steps < 20:
             print(
@@ -114,6 +118,38 @@ class H3SamplerResMultistep:
         text_states = text_states[0].detach().to(device="cpu", dtype=torch.float32).contiguous()
         if text_states.shape[0] < 1 or not bool(torch.isfinite(text_states).all().item()):
             raise ValueError("H3 text conditioning is empty or contains NaN/Inf.")
+
+        keyframes = []
+        encoder = None
+        try:
+            if first_frame is not None or last_frame is not None:
+                # Reuse the endpoint encoder and preprocessing from FL2VA Beta.
+                from .h3_sampler_fl2va_beta import (
+                    _encode_keyframe,
+                    _load_streaming_encoder,
+                )
+                encoder = _load_streaming_encoder()
+                if first_frame is not None:
+                    first_latent = _encode_keyframe(
+                        encoder, first_frame, width, height, "stretch", "first frame"
+                    )
+                    keyframes.append({
+                        "resolved_frame_index": 0,
+                        "latent": first_latent,
+                    })
+                if last_frame is not None:
+                    last_latent = _encode_keyframe(
+                        encoder, last_frame, width, height, "center", "last frame"
+                    )
+                    keyframes.append({
+                        "resolved_frame_index": frames - 1,
+                        "latent": last_latent,
+                    })
+        finally:
+            if encoder is not None:
+                del encoder
+                gc.collect()
+                torch.cuda.empty_cache()
 
         latent_t = 2 if frames <= 5 else ((frames - 5) // 17) * 5 + 2
         latent_h = height // 16
@@ -156,7 +192,7 @@ class H3SamplerResMultistep:
             )
             video_latent, audio_latent, elapsed, _, _ = transformer.sample(
                 text_states=text_states,
-                keyframes=[],
+                keyframes=keyframes,
                 latent_t=latent_t,
                 latent_h=latent_h,
                 latent_w=latent_w,
@@ -176,7 +212,7 @@ class H3SamplerResMultistep:
                 print_memory_stats=bool(print_memory_stats),
                 print_sampler_diagnostics=bool(print_sampler_diagnostics),
             )
-            del text_states
+            del text_states, keyframes
             gc.collect()
             _check_interrupted()
             print(
