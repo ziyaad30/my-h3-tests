@@ -1,10 +1,10 @@
-"""End-to-end MiniMax H3 LightVAE-Lite video VAE round-trip test.
+"""Single-image MiniMax H3 LightVAE-Lite round-trip test.
 
-Runs the standalone encoder and decoder on the same five-frame clip:
-RGB [1,3,5,H,W] -> normalized latents [1,24,2,H/16,W/16] -> RGB [1,3,5,H,W].
+Matches the ComfyUI still-image workflow:
+one RGB image -> one [1,24,1,H/16,W/16] latent -> one RGB image.
 
-By default this uses a deterministic synthetic test chart. Set INPUT_FRAME_PATHS
-to exactly five image paths to test a real five-frame sample instead.
+Place an image named input.png beside this script, or change INPUT_IMAGE_PATH.
+The image dimensions are preserved and must be divisible by 16.
 """
 
 import gc
@@ -13,119 +13,66 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image, ImageOps
+from PIL import Image
 
 from minimax_h3_lightvae_encoder import (
-    CANVAS_HEIGHT,
-    CANVAS_WIDTH,
     DEVICE,
-    load_keyframe_image,
+    encode_keyframe_latent,
     load_streaming_encoder,
 )
-from minimax_h3_lightvae_decoder import decode_video_latents
+from minimax_h3_lightvae_decoder import decode_single_image_latent
 
 
 ROOT = Path(__file__).resolve().parent
+INPUT_IMAGE_PATH = ROOT / "input.png"
 OUTPUT_DIR = ROOT / "lightvae_roundtrip_test"
-
-# Supply exactly five image paths, or leave empty for the synthetic chart.
-INPUT_FRAME_PATHS = []
-
-EXPECTED_INPUT_FRAMES = 5
+LATENT_PATH = OUTPUT_DIR / "image_latent.pt"
+OUTPUT_IMAGE_PATH = OUTPUT_DIR / "reconstruction.png"
 
 
-def make_synthetic_clip():
-    """Create a deterministic spatial test chart, repeated for five frames."""
-    x = torch.linspace(0.0, 1.0, CANVAS_WIDTH).view(1, 1, 1, CANVAS_WIDTH)
-    y = torch.linspace(0.0, 1.0, CANVAS_HEIGHT).view(1, 1, CANVAS_HEIGHT, 1)
+def load_rgb_image(path):
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Input image not found: {path}\n"
+            "Place one image named input.png beside this script or edit INPUT_IMAGE_PATH."
+        )
 
-    red = x.expand(1, 1, CANVAS_HEIGHT, CANVAS_WIDTH)
-    green = y.expand(1, 1, CANVAS_HEIGHT, CANVAS_WIDTH)
-    blue = (((x * 8).floor() % 2) * 0.7 + y * 0.3).expand(
-        1, 1, CANVAS_HEIGHT, CANVAS_WIDTH
-    )
+    with Image.open(path) as source:
+        image = source.convert("RGB")
 
-    chart = torch.cat((red, green, blue), dim=1) * 2.0 - 1.0
-
-    # Add hard-edged regions and thin lines to make spatial blending defects visible.
-    chart[:, :, 48:112, 48:112] = torch.tensor(
-        [[[[-1.0]], [[1.0]], [[-1.0]]]]
-    )
-    chart[:, :, 208:272, 208:272] = torch.tensor(
-        [[[[1.0]], [[-1.0]], [[1.0]]]]
-    )
-    chart[:, :, 159:161, :] = 0.0
-    chart[:, :, :, 159:161] = 0.0
-
-    return chart.unsqueeze(2).repeat(1, 1, EXPECTED_INPUT_FRAMES, 1, 1).contiguous()
-
-
-def load_input_clip():
-    if not INPUT_FRAME_PATHS:
-        print("Input: deterministic synthetic test chart")
-        return make_synthetic_clip()
-
-    if len(INPUT_FRAME_PATHS) != EXPECTED_INPUT_FRAMES:
+    width, height = image.size
+    if width % 16 or height % 16:
         raise ValueError(
-            f"INPUT_FRAME_PATHS must contain exactly {EXPECTED_INPUT_FRAMES} paths."
+            f"Image dimensions must be divisible by 16 for H3 VAE encoding; "
+            f"received {width}x{height}. The image is not resized automatically."
         )
 
-    frames = [
-        load_keyframe_image(path, CANVAS_WIDTH, CANVAS_HEIGHT, "center")
-        for path in INPUT_FRAME_PATHS
-    ]
-    print("Input frames:")
-    for path in INPUT_FRAME_PATHS:
-        print("  ", Path(path))
-    return torch.cat(frames, dim=2).contiguous()
+    array = np.asarray(image, dtype=np.float32) / 127.5 - 1.0
+    tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0).unsqueeze(2)
+    return image, tensor.contiguous()
 
 
-def save_input_frames(video):
-    input_dir = OUTPUT_DIR / "input_frames"
-    input_dir.mkdir(parents=True, exist_ok=True)
+def save_metrics(source_image, decoded_path):
+    source = np.asarray(source_image.convert("RGB"), dtype=np.float32) / 127.5 - 1.0
 
-    cpu = video[0].detach().float().cpu()
-    for index in range(cpu.shape[1]):
-        rgb = ((cpu[:, index].clamp(-1, 1) + 1.0) * 127.5).round()
-        array = rgb.to(torch.uint8).permute(1, 2, 0).contiguous().numpy()
-        Image.fromarray(array, mode="RGB").save(
-            input_dir / f"input_{index + 1:04d}.png"
-        )
-    return input_dir
+    with Image.open(decoded_path) as decoded_image:
+        decoded_image = decoded_image.convert("RGB")
+        if decoded_image.size != source_image.size:
+            raise RuntimeError(
+                f"Decoded size {decoded_image.size} does not match input size {source_image.size}."
+            )
+        decoded = np.asarray(decoded_image, dtype=np.float32) / 127.5 - 1.0
 
+    difference = decoded - source
+    mae = float(np.mean(np.abs(difference)))
+    mse = float(np.mean(np.square(difference)))
+    psnr = math.inf if mse == 0.0 else 10.0 * math.log10(4.0 / mse)
 
-def report_roundtrip_metrics(video, decoded_frames_dir):
-    source = video[0].detach().float().cpu()
-    rows = []
-
-    for index in range(EXPECTED_INPUT_FRAMES):
-        output_path = decoded_frames_dir / f"frame_{index + 1:04d}.png"
-        if not output_path.is_file():
-            raise FileNotFoundError(f"Decoder did not export expected frame: {output_path}")
-
-        with Image.open(output_path) as image:
-            decoded = np.asarray(image.convert("RGB"), dtype=np.float32) / 127.5 - 1.0
-
-        original = source[:, index].permute(1, 2, 0).numpy()
-        difference = decoded - original
-        mae = float(np.mean(np.abs(difference)))
-        mse = float(np.mean(np.square(difference)))
-        psnr = math.inf if mse == 0.0 else 10.0 * math.log10(4.0 / mse)
-        rows.append((index + 1, mae, psnr))
-
-    print("\nPer-frame reconstruction metrics (RGB values normalized to [-1,1]):")
-    for index, mae, psnr in rows:
-        print(f"  Frame {index}: MAE={mae:.6f} | PSNR={psnr:.2f} dB")
-
-    mean_mae = sum(row[1] for row in rows) / len(rows)
-    finite_psnr = [row[2] for row in rows if math.isfinite(row[2])]
-    mean_psnr = (
-        sum(finite_psnr) / len(finite_psnr)
-        if finite_psnr
-        else math.inf
-    )
-    print(f"  Mean: MAE={mean_mae:.6f} | PSNR={mean_psnr:.2f} dB")
-    print("Note: these metrics quantify pixel error; they do not by themselves diagnose tile seams.")
+    print("\nSingle-image reconstruction metrics (RGB normalized to [-1,1]):")
+    print(f"  MAE:  {mae:.6f}")
+    print(f"  PSNR: {psnr:.2f} dB")
+    print("Note: pixel metrics quantify reconstruction error; inspect the image for visible tile seams.")
 
 
 @torch.inference_mode()
@@ -133,43 +80,28 @@ def main():
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA GPU unavailable; this test uses the streaming CUDA implementations.")
 
-    if CANVAS_WIDTH % 32 or CANVAS_HEIGHT % 32:
-        raise ValueError("Canvas dimensions must be divisible by 32.")
-
-    video = load_input_clip()
-    expected_input_shape = (1, 3, EXPECTED_INPUT_FRAMES, CANVAS_HEIGHT, CANVAS_WIDTH)
-    if tuple(video.shape) != expected_input_shape:
-        raise RuntimeError(
-            f"Input shape {tuple(video.shape)}; expected {expected_input_shape}"
-        )
-    if not torch.isfinite(video).all():
-        raise ValueError("Input clip contains NaN or Inf.")
-
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    input_dir = save_input_frames(video)
+    source_image, image_tensor = load_rgb_image(INPUT_IMAGE_PATH)
+    width, height = source_image.size
 
-    print("\n========== H3 LIGHTVAE-LITE ROUND TRIP ==========")
+    print("\n========== H3 LIGHTVAE-LITE SINGLE-IMAGE ROUND TRIP ==========")
     print("GPU:", torch.cuda.get_device_name(0))
     print("PyTorch:", torch.__version__)
     print("CUDA:", torch.version.cuda)
-    print("Input clip:", tuple(video.shape))
-    print("Input range:", float(video.min()), float(video.max()))
+    print("Input image:", INPUT_IMAGE_PATH.resolve())
+    print("Input tensor:", tuple(image_tensor.shape))
+    print("Input range:", float(image_tensor.min()), float(image_tensor.max()))
+    print("Image dimensions:", f"{width}x{height}")
     print("Output directory:", OUTPUT_DIR.resolve())
 
     print("\nLoading standalone LightVAE-Lite encoder...")
     encoder = load_streaming_encoder()
 
-    print("\nEncoding five input frames...")
-    latents = encoder(video)
+    print("\nEncoding exactly one image...")
+    latents = encode_keyframe_latent(encoder, image_tensor)
     torch.cuda.synchronize(DEVICE)
 
-    expected_latent_shape = (
-        1,
-        24,
-        2,
-        CANVAS_HEIGHT // 16,
-        CANVAS_WIDTH // 16,
-    )
+    expected_latent_shape = (1, 24, 1, height // 16, width // 16)
     if tuple(latents.shape) != expected_latent_shape:
         raise RuntimeError(
             f"Encoder latent shape {tuple(latents.shape)}; expected {expected_latent_shape}"
@@ -177,41 +109,32 @@ def main():
     if not torch.isfinite(latents).all():
         raise RuntimeError("Encoder produced NaN or Inf latents.")
 
-    print("Encoded latent shape:", tuple(latents.shape))
+    print("Encoded image latent shape:", tuple(latents.shape))
     print("Latent range:", float(latents.min()), float(latents.max()))
 
-    # Release the encoder before loading the decoder to minimize host/GPU memory use.
+    # Free encoder weights before loading the decoder, as on the 4 GB GPU.
     del encoder
     gc.collect()
     torch.cuda.empty_cache()
 
-    latent_path = OUTPUT_DIR / "roundtrip_latents.pt"
-    torch.save(latents.detach().cpu(), latent_path)
-    print("Saved normalized latents:", latent_path)
+    torch.save(latents.detach().cpu(), LATENT_PATH)
+    print("Saved image latent:", LATENT_PATH.resolve())
 
-    print("\nDecoding those exact latents with the standalone LightVAE-Lite decoder...")
-    result = decode_video_latents(
+    print("\nDecoding that single image latent...")
+    decode_single_image_latent(
         latents=latents,
-        output_dir=OUTPUT_DIR / "decoded",
-        fps=24,
+        output_path=OUTPUT_IMAGE_PATH,
     )
     torch.cuda.synchronize(DEVICE)
 
-    if result["frame_count"] != EXPECTED_INPUT_FRAMES:
-        raise RuntimeError(
-            f"Decoder returned {result['frame_count']} frames; expected {EXPECTED_INPUT_FRAMES}"
-        )
+    save_metrics(source_image, OUTPUT_IMAGE_PATH)
 
-    report_roundtrip_metrics(video, result["frames_dir"])
+    print("\n========== SINGLE-IMAGE ROUND TRIP COMPLETE ==========")
+    print("Input image:", INPUT_IMAGE_PATH.resolve())
+    print("Reconstructed image:", OUTPUT_IMAGE_PATH.resolve())
+    print("Image latent:", LATENT_PATH.resolve())
 
-    print("\n========== ROUND TRIP TEST COMPLETE ==========")
-    print("Input frames:", input_dir.resolve())
-    print("Decoded frames:", result["frames_dir"].resolve())
-    if result["mp4_path"] is not None:
-        print("Decoded MP4:", result["mp4_path"].resolve())
-    print("Latents:", latent_path.resolve())
-
-    del latents, video
+    del latents, image_tensor
     gc.collect()
     torch.cuda.empty_cache()
 
