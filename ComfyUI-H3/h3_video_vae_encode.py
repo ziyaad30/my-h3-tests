@@ -9,7 +9,6 @@ from __future__ import annotations
 import gc
 import logging
 import sys
-import time
 import types
 from pathlib import Path
 
@@ -30,7 +29,7 @@ if str(NODE_ROOT) not in sys.path:
     sys.path.insert(0, str(NODE_ROOT))
 
 from lightvae_h3_standalone.lightvae.h3_lightvae_encoder import Encoder
-from lightvae_h3_standalone.lightvae.utils import latent_frames, padded_frames
+from lightvae_h3_standalone.lightvae.utils import latent_frames, padded_frames, split_tiles
 
 
 def _streaming_encode_clip(self, video):
@@ -40,62 +39,60 @@ def _streaming_encode_clip(self, video):
     video = ((video + 1.0) / 2.0 - mean) / std
 
     device = self._h3_device
-    started = time.perf_counter()
+    progress = getattr(self, "_h3_progress", None)
 
-    def report(stage):
-        log.info("[LightVAE Encode] %s | %.1f sec elapsed", stage, time.perf_counter() - started)
+    def advance():
+        if progress is not None:
+            progress.update(1)
 
     hidden_states = video.to(device=device, dtype=DTYPE)
-    report("Input staged on GPU")
 
     self.encoder.conv_in.to(device=device, dtype=DTYPE)
     try:
-        report("Initial convolution")
         hidden_states = self.encoder.conv_in(hidden_states)
+        advance()
     finally:
         self.encoder.conv_in.to(device="cpu")
 
-    for stage_index, down_block in enumerate(self.encoder.down_blocks, start=1):
-        report(f"Down stage {stage_index}/{len(self.encoder.down_blocks)}")
-        for resnet_index, resnet in enumerate(down_block.resnets, start=1):
-            report(f"  Residual block {resnet_index}/{len(down_block.resnets)}")
+    for down_block in self.encoder.down_blocks:
+        for resnet in down_block.resnets:
             resnet.to(device=device, dtype=DTYPE)
             try:
                 hidden_states = resnet(hidden_states)
+                advance()
             finally:
                 resnet.to(device="cpu")
 
         if down_block.downsamplers is not None:
-            for downsampler_index, downsampler in enumerate(down_block.downsamplers, start=1):
-                report(f"  Downsample {downsampler_index}/{len(down_block.downsamplers)}")
+            for downsampler in down_block.downsamplers:
                 downsampler.to(device=device, dtype=DTYPE)
                 try:
                     hidden_states = downsampler(hidden_states)
+                    advance()
                 finally:
                     downsampler.to(device="cpu")
 
-    report("Output normalization")
     self.encoder.norm_out.to(device=device, dtype=DTYPE)
     try:
         hidden_states = F.silu(self.encoder.norm_out(hidden_states))
+        advance()
     finally:
         self.encoder.norm_out.to(device="cpu")
 
-    report("Output convolution")
     self.encoder.conv_out.to(device=device, dtype=DTYPE)
     try:
         moments = self.encoder.conv_out(hidden_states)
+        advance()
     finally:
         self.encoder.conv_out.to(device="cpu")
 
-    report("Quantization convolution")
     self.quant_conv.to(device=device, dtype=DTYPE)
     try:
         moments = self.quant_conv(moments)
+        advance()
     finally:
         self.quant_conv.to(device="cpu")
 
-    report("Clip complete")
     return moments.to(device="cpu")
 
 
@@ -261,9 +258,31 @@ class H3VideoVAEEncodeLight:
             frame_count, padded_count, width, height,
         )
 
-        # Encoder.forward() performs posterior-mean selection and H3
-        # diffusion latent normalization itself. Do not normalize a second time.
-        samples = model(video)
+        # Count every staged module operation across all temporal clips and
+        # spatial tiles so ComfyUI can show real node execution progress.
+        import comfy.utils
+
+        window_frames = ((padded_count + 16) // 17) * 17
+        height_tiles, _ = split_tiles(height, model.tile_size, model.tile_overlap)
+        width_tiles, _ = split_tiles(width, model.tile_size, model.tile_overlap)
+        clips = (window_frames // 17) * len(height_tiles) * len(width_tiles)
+        operations_per_clip = (
+            1
+            + sum(len(stage.resnets) for stage in model.encoder.down_blocks)
+            + sum(
+                len(stage.downsamplers) if stage.downsamplers is not None else 0
+                for stage in model.encoder.down_blocks
+            )
+            + 3
+        )
+        progress = comfy.utils.ProgressBar(clips * operations_per_clip)
+        model._h3_progress = progress
+        try:
+            # Encoder.forward() performs posterior-mean selection and H3
+            # diffusion latent normalization itself. Do not normalize a second time.
+            samples = model(video)
+        finally:
+            model._h3_progress = None
         if not isinstance(samples, torch.Tensor) or samples.ndim != 5:
             shape = tuple(samples.shape) if isinstance(samples, torch.Tensor) else type(samples).__name__
             raise RuntimeError(f"Unexpected H3 encoder output: {shape}")
