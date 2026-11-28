@@ -15,7 +15,7 @@ def _check_interrupted():
     comfy.model_management.throw_exception_if_processing_interrupted()
 
 
-class H3SamplerResMultistep:
+class H3SamplerResMultistepLatent:
     @classmethod
     def INPUT_TYPES(cls):
         return {
