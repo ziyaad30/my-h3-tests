@@ -88,6 +88,14 @@ class H3SamplerResMultistep:
         if video_shift <= 0 or audio_shift <= 0:
             raise ValueError("Video and audio shifts must both be positive.")
 
+        if lora is None and steps < 20:
+            print(
+                "[H3 sampler warning] No LoRA is connected and RES Multistep is experimental. "
+                "For the base H3 checkpoint, use the standard H3 Sampler (Euler) with "
+                "the reference 50-step default; low-step RES output is not a validated base-model path.",
+                flush=True,
+            )
+
         from comfy.utils import ProgressBar
         progress = ProgressBar(steps * NUM_BLOCKS)
 
