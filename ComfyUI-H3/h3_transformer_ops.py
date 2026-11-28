@@ -420,14 +420,26 @@ def streamed_attention(
 # ============================================================
 
 def _print_tensor_summary(label, tensor):
-    """Print scalar activation statistics for the isolated B2 investigation."""
-    value = tensor.detach().float()
+    """Print scalar activation statistics using bounded temporary chunks."""
+    sum_abs = torch.zeros((), device=tensor.device, dtype=torch.float64)
+    sum_sq = torch.zeros((), device=tensor.device, dtype=torch.float64)
+    maximum = torch.tensor(float("-inf"), device=tensor.device)
+    minimum = torch.tensor(float("inf"), device=tensor.device)
+    count = 0
+    chunk_rows = 8
+    for first in range(0, tensor.shape[0], chunk_rows):
+        value = tensor[first:first + chunk_rows].detach().float()
+        sum_abs += value.abs().sum(dtype=torch.float64)
+        sum_sq += value.square().sum(dtype=torch.float64)
+        maximum = torch.maximum(maximum, value.max())
+        minimum = torch.minimum(minimum, value.min())
+        count += value.numel()
     print(
         f"[H3 B2 internals] {label:<30} "
-        f"rms={torch.sqrt(value.square().mean()).item():.5g} "
-        f"mean_abs={value.abs().mean().item():.5g} "
-        f"max_abs={value.abs().max().item():.5g} "
-        f"min={value.min().item():.5g} max={value.max().item():.5g}",
+        f"rms={torch.sqrt(sum_sq / count).item():.5g} "
+        f"mean_abs={(sum_abs / count).item():.5g} "
+        f"max_abs={maximum.abs().item():.5g} "
+        f"min={minimum.item():.5g} max={maximum.item():.5g}",
         flush=True,
     )
 
@@ -772,8 +784,12 @@ class H3TransformerBlock(torch.nn.Module):
         if self.print_internal_diagnostics:
             _print_tensor_summary("B2 norm1 RMSNorm", normalized)
             _print_tensor_summary("B2 norm1 weight", self.norm1_weight)
+            token_tags = torch.remainder(adaln_indices, 3)
             for modality_name, modality_id in (("video", VIDEO), ("audio", AUDIO)):
-                row = modality_id
+                matching = torch.nonzero(token_tags == modality_id, as_tuple=False)
+                if matching.numel() == 0:
+                    continue
+                row = int(adaln_indices[matching[0, 0]].item())
                 for group in range(6):
                     _print_tensor_summary(
                         f"B2 {modality_name} modulation g{group}",
