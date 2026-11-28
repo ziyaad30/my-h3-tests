@@ -757,10 +757,10 @@ def decode_q3k_reference(raw):
 
 
 @njit(cache=True, parallel=True)
-def _decode_q3k_numba_kernel(blocks):
+def _decode_q3k_numba_kernel(blocks, d_values):
     output = np.empty(blocks.shape[0] * 256, dtype=np.float32)
     for b in prange(blocks.shape[0]):
-        d = np.float32(np.frombuffer(blocks[b, 108:110].tobytes(), dtype=np.float16)[0])
+        d = d_values[b]
         scales = np.empty(16, dtype=np.int32)
         for i in range(16):
             low = int(blocks[b, 96 + i] & 15) if i < 8 else int(blocks[b, 96 + i - 8] >> 4)
@@ -800,7 +800,10 @@ def decode_q3k(raw):
         raise ValueError(f"Invalid Q3_K data size: {raw.size} bytes; expected a multiple of 110.")
     block_count = raw.size // Q3K_BLOCK_BYTES
     blocks = np.ascontiguousarray(raw.reshape(block_count, Q3K_BLOCK_BYTES))
-    return _decode_q3k_numba_kernel(blocks)
+    d_values = np.frombuffer(
+        blocks[:, 108:110].copy().tobytes(), dtype="<f2"
+    ).astype(np.float32)
+    return _decode_q3k_numba_kernel(blocks, d_values)
 
 
 def test_q3k_decoder():
@@ -1134,6 +1137,7 @@ def main():
     print(f"Tokens:     {args.tokens}")
     print(f"Q2_K CPU threads: {Q2K_NUM_THREADS}")
     print(f"CUDA minimum row tile: {CUDA_MIN_ROW_TILE}")
+    test_q3k_decoder()
 
     with GGUF(args.gguf) as gguf:
 
