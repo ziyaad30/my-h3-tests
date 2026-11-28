@@ -110,7 +110,7 @@ def _h3_position_aware_decoder_forward(
 
 
 def _h3_position_aware_decode_pixels(
-    self, latents, full_dims, offsets
+    self, latents, full_dims=None, offsets=None
 ):
     decoded_latents = self.post_quant_conv(latents)
     return self.decoder(
