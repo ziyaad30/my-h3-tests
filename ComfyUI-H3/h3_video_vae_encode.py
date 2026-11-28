@@ -246,30 +246,23 @@ class H3VideoVAEEncodeLight:
             frame_count, padded_count, width, height,
         )
 
-        moments = model(video)
-        if not isinstance(moments, torch.Tensor) or moments.ndim != 5:
-            shape = tuple(moments.shape) if isinstance(moments, torch.Tensor) else type(moments).__name__
+        # Encoder.forward() performs posterior-mean selection and H3
+        # diffusion latent normalization itself. Do not normalize a second time.
+        samples = model(video)
+        if not isinstance(samples, torch.Tensor) or samples.ndim != 5:
+            shape = tuple(samples.shape) if isinstance(samples, torch.Tensor) else type(samples).__name__
             raise RuntimeError(f"Unexpected H3 encoder output: {shape}")
 
         latent_channels = int(model.latent_channels)
-        if moments.shape[1] != latent_channels * 2:
+        if samples.shape[1] != latent_channels:
             raise RuntimeError(
-                f"Expected {latent_channels * 2} posterior moment channels, "
-                f"received {moments.shape[1]}."
+                f"Expected {latent_channels} normalized latent channels, "
+                f"received {samples.shape[1]}."
             )
-        if moments.shape[2] != expected_latent_frames:
+        if samples.shape[2] != expected_latent_frames:
             raise RuntimeError(
-                f"Expected {expected_latent_frames} latent frames, received {moments.shape[2]}."
+                f"Expected {expected_latent_frames} latent frames, received {samples.shape[2]}."
             )
-
-        # Match the native H3 VAE's posterior-mean latent interface:
-        # take the first half of moments and apply diffusion latent normalization.
-        posterior_mean = moments[:, :latent_channels].float()
-        mean = model.latents_mean.float().view(1, -1, 1, 1, 1)
-        std = model.latents_std.float().view(1, -1, 1, 1, 1)
-        samples = (posterior_mean - mean) / std
-        if not torch.isfinite(samples).all():
-            raise RuntimeError("H3 encoder produced NaN or Inf latents.")
 
         samples = samples.contiguous()
         expected_shape = (
@@ -279,8 +272,10 @@ class H3VideoVAEEncodeLight:
             raise RuntimeError(
                 f"Expected H3 latent shape {expected_shape}, received {tuple(samples.shape)}."
             )
+        if not torch.isfinite(samples).all():
+            raise RuntimeError("H3 encoder produced NaN or Inf latents.")
 
-        del video, moments, posterior_mean
+        del video
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return ({"samples": samples},)
