@@ -23,7 +23,7 @@ class H3Sampler:
                 "width": ("INT", {"default": 480, "min": 32, "max": 4096, "step": 32}),
                 "height": ("INT", {"default": 256, "min": 32, "max": 4096, "step": 32}),
                 "frames": ("INT", {"default": 22, "min": 5, "max": 1000, "step": 17}),
-                "steps": ("INT", {"default": 7, "min": 1, "max": 100}),
+                "steps": ("INT", {"default": 50, "min": 1, "max": 100}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
             },
             "optional": {
