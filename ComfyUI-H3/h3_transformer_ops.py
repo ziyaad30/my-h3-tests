@@ -446,6 +446,31 @@ def _print_tensor_summary(label, tensor):
     )
 
 
+def _print_modality_tensor_summary(label, tensor, token_tags):
+    """Print per-modality activation RMS/max using bounded row chunks."""
+    chunk_size = 128
+    for modality_name, modality_id in (("video", VIDEO), ("audio", AUDIO)):
+        sum_sq = torch.zeros((), device=tensor.device, dtype=torch.float32)
+        max_abs = torch.zeros((), device=tensor.device, dtype=torch.float32)
+        count = 0
+        for first in range(0, tensor.shape[0], chunk_size):
+            last = min(first + chunk_size, tensor.shape[0])
+            mask = token_tags[first:last] == modality_id
+            if not bool(mask.any().item()):
+                continue
+            value = tensor[first:last][mask].detach().float()
+            sum_sq += value.square().sum()
+            max_abs = torch.maximum(max_abs, value.abs().max())
+            count += value.numel()
+        if count:
+            print(
+                f"[H3 block internals] {label:<30} {modality_name:<5} "
+                f"rms={torch.sqrt(sum_sq / count).item():.5g} "
+                f"max_abs={max_abs.item():.5g}",
+                flush=True,
+            )
+
+
 def _print_residual_modality_stats(label, tensor, token_tags):
     """Print compact video/audio statistics without copying full token streams."""
     chunk_size = 256
@@ -979,7 +1004,9 @@ class H3TransformerBlock(torch.nn.Module):
             dtype=torch.float32,
         )
         if self.print_internal_diagnostics:
-            _print_tensor_summary(f"B{self.block_index + 1} FC1 before LoRA", fc1_output)
+            _print_modality_tensor_summary(
+                f"B{self.block_index + 1} FC1 before LoRA", fc1_output, token_tags
+            )
 
         del fc1_cpu
 
@@ -993,7 +1020,9 @@ class H3TransformerBlock(torch.nn.Module):
         if self.lora is not None:
             self.lora.add_linear("fc1", normalized, fc1_output)
         if self.print_internal_diagnostics:
-            _print_tensor_summary(f"B{self.block_index + 1} FC1 after LoRA", fc1_output)
+            _print_modality_tensor_summary(
+                f"B{self.block_index + 1} FC1 after LoRA", fc1_output, token_tags
+            )
         del normalized
 
         # ----------------------------------------------------
@@ -1002,7 +1031,9 @@ class H3TransformerBlock(torch.nn.Module):
 
         mlp_hidden = swiglu(fc1_output)
         if self.print_internal_diagnostics:
-            _print_tensor_summary(f"B{self.block_index + 1} SwiGLU", mlp_hidden)
+            _print_modality_tensor_summary(
+                f"B{self.block_index + 1} SwiGLU", mlp_hidden, token_tags
+            )
 
         del fc1_output
 
@@ -1017,11 +1048,15 @@ class H3TransformerBlock(torch.nn.Module):
             dtype=torch.float32,
         )
         if self.print_internal_diagnostics:
-            _print_tensor_summary(f"B{self.block_index + 1} FC2 before LoRA", mlp_output)
+            _print_modality_tensor_summary(
+                f"B{self.block_index + 1} FC2 before LoRA", mlp_output, token_tags
+            )
         if self.lora is not None:
             self.lora.add_linear("fc2", mlp_hidden, mlp_output)
         if self.print_internal_diagnostics:
-            _print_tensor_summary(f"B{self.block_index + 1} FC2 after LoRA", mlp_output)
+            _print_modality_tensor_summary(
+                f"B{self.block_index + 1} FC2 after LoRA", mlp_output, token_tags
+            )
 
         del fc2_cpu, mlp_hidden
 
