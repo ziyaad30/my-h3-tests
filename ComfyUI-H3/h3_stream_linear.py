@@ -821,7 +821,19 @@ def test_q3k_decoder():
     expected = decode_q3k_reference(raw.tobytes())
     actual = decode_q3k(raw)
     np.testing.assert_allclose(actual, expected, rtol=0, atol=0)
-    print("Q3_K reference/Numba decoder parity: PASSED")
+
+    torch_cpu = _decode_q3k_torch(
+        raw.tobytes(), blocks.shape[0], Q3K_BLOCK_ELEMENTS, "cpu"
+    ).numpy().reshape(-1)
+    np.testing.assert_allclose(torch_cpu, expected, rtol=0, atol=0)
+
+    if torch.cuda.is_available():
+        torch_cuda = _decode_q3k_torch(
+            raw.tobytes(), blocks.shape[0], Q3K_BLOCK_ELEMENTS, "cuda:0"
+        ).cpu().numpy().reshape(-1)
+        np.testing.assert_allclose(torch_cuda, expected, rtol=0, atol=0)
+
+    print("Q3_K reference/Numba/Torch decoder parity: PASSED")
 
 
 @torch.inference_mode()
@@ -1199,7 +1211,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60)
-    print("H3 PARALLEL Q2_K STREAMED LINEAR")
+    print("H3 Q2_K/Q3_K STREAMED LINEAR")
     print("=" * 60)
 
     print(f"Checkpoint: {args.gguf}")
