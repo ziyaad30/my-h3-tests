@@ -775,11 +775,11 @@ class H3InferenceEngine:
             # tensor-stat toggle. It identifies the first block where either
             # modality's hidden stream starts growing.
             block.print_residual_diagnostics = self.print_tensor_stats
-            # Block 2 is the first major video-amplification point in the
-            # user's one-evaluation trace. Inspect its internal MLP stages
-            # without enabling expensive activation summaries in other blocks.
+            # Inspect only blocks implicated by the supplied trace:
+            # B2 (first video growth), B6 (first audio growth), and B19
+            # (the large isolated video outlier).
             block.print_internal_diagnostics = (
-                self.print_tensor_stats and block_index == 1
+                self.print_tensor_stats and block_index in (1, 5, 18)
             )
 
             if self.print_tensor_stats:
