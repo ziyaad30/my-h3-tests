@@ -794,6 +794,7 @@ class H3InferenceEngine:
                     block.lora = self.lora.load_block(
                         "blocks", block.block_index, block.device
                     )
+                    block.lora.print_diagnostics = block.print_internal_diagnostics
 
                 # hidden stays in CPU RAM between blocks. The active block
                 # computes on CUDA and returns its output to CPU.
