@@ -29,8 +29,11 @@ def latent_frames(family, frames):
 
 
 def h3_decoded_frames(frames):
+    # Native ComfyUI H3 VAE supports a separate single-image latent path.
+    if frames == 1:
+        return 1
     if frames < 2 or (frames - 2) % 5:
-        raise ValueError("H3 latent frames must have the form 5*n+2")
+        raise ValueError("H3 video latent frames must have the form 5*n+2, or be a single-image latent (T=1)")
     return (frames - 2) // 5 * 17 + 5
 
 
