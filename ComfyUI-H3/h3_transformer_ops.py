@@ -293,12 +293,12 @@ def swiglu(x):
             "SwiGLU input width must be divisible by two"
         )
 
-    # MiniMax-H3's checkpoint stores the fused FC1 halves as
-    # [value, gate], matching Diffusers' SwiGLU.forward:
-    # hidden_states, gate = hidden_states.chunk(2, dim=-1)
-    value, gate = x.chunk(2, dim=-1)
+    # The original MiniMax-H3 checkpoint (and its GGUF tensor) stores
+    # the fused FC1 halves as [gate, value]. Diffusers swaps these halves
+    # during conversion because its SwiGLU implementation expects [value, gate].
+    gate, value = x.chunk(2, dim=-1)
 
-    return value * torch.nn.functional.silu(gate)
+    return torch.nn.functional.silu(gate) * value
 
 
 # ============================================================
@@ -1190,8 +1190,8 @@ def test_swiglu(device):
     )
 
     output = swiglu(x)
-    value, gate = x.chunk(2, dim=-1)
-    expected = value * torch.nn.functional.silu(gate)
+    gate, value = x.chunk(2, dim=-1)
+    expected = torch.nn.functional.silu(gate) * value
 
     require(
         output.shape == (4, MLP_HIDDEN_SIZE),
@@ -1199,7 +1199,7 @@ def test_swiglu(device):
     )
     require(
         torch.equal(output, expected),
-        "SwiGLU does not match H3 checkpoint [value, gate] ordering",
+        "SwiGLU does not match original H3 checkpoint [gate, value] ordering",
     )
 
     check_finite("SwiGLU", output)
