@@ -238,11 +238,6 @@ def encode_keyframe_latent(encoder, image):
             f"Keyframe dimensions must be divisible by 16: {width}x{height}"
         )
 
-    if height % 32 or width % 32:
-        raise ValueError(
-            "FL2VA keyframe canvas dimensions must be divisible by 32."
-        )
-
     image = image.detach().to(
         device="cpu",
         dtype=torch.float32,
