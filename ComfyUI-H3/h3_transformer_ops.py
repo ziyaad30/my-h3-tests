@@ -419,6 +419,19 @@ def streamed_attention(
 # H3 TRANSFORMER BLOCK
 # ============================================================
 
+def _print_tensor_summary(label, tensor):
+    """Print scalar activation statistics for the isolated B2 investigation."""
+    value = tensor.detach().float()
+    print(
+        f"[H3 B2 internals] {label:<30} "
+        f"rms={torch.sqrt(value.square().mean()).item():.5g} "
+        f"mean_abs={value.abs().mean().item():.5g} "
+        f"max_abs={value.abs().max().item():.5g} "
+        f"min={value.min().item():.5g} max={value.max().item():.5g}",
+        flush=True,
+    )
+
+
 def _print_residual_modality_stats(label, tensor, token_tags):
     """Print compact video/audio statistics without copying full token streams."""
     chunk_size = 256
@@ -526,6 +539,7 @@ class H3TransformerBlock(torch.nn.Module):
         self.gguf = gguf
         self.block_index = int(block_index)
         self.print_residual_diagnostics = False
+        self.print_internal_diagnostics = False
 
         # TiledGGUFLinear expects a string for its device argument.
         self.device = torch.device(device)
@@ -755,6 +769,16 @@ class H3TransformerBlock(torch.nn.Module):
             x,
             self.norm1_weight,
         )
+        if self.print_internal_diagnostics:
+            _print_tensor_summary("B2 norm1 RMSNorm", normalized)
+            _print_tensor_summary("B2 norm1 weight", self.norm1_weight)
+            for modality_name, modality_id in (("video", VIDEO), ("audio", AUDIO)):
+                row = modality_id
+                for group in range(6):
+                    _print_tensor_summary(
+                        f"B2 {modality_name} modulation g{group}",
+                        modulation_table[row, group],
+                    )
 
         normalized = apply_adaln_indexed(
             normalized,
@@ -764,6 +788,8 @@ class H3TransformerBlock(torch.nn.Module):
             scale_group=1,
             token_tile=self.token_tile,
         )
+        if self.print_internal_diagnostics:
+            _print_tensor_summary("B2 norm1 after AdaLN", normalized)
 
         # ----------------------------------------------------
         # QKV PROJECTION
@@ -900,6 +926,9 @@ class H3TransformerBlock(torch.nn.Module):
             x,
             self.norm2_weight,
         )
+        if self.print_internal_diagnostics:
+            _print_tensor_summary("B2 norm2 RMSNorm", normalized)
+            _print_tensor_summary("B2 norm2 weight", self.norm2_weight)
 
         normalized = apply_adaln_indexed(
             normalized,
@@ -909,6 +938,8 @@ class H3TransformerBlock(torch.nn.Module):
             scale_group=4,
             token_tile=self.token_tile,
         )
+        if self.print_internal_diagnostics:
+            _print_tensor_summary("B2 norm2 after AdaLN", normalized)
 
         # ----------------------------------------------------
         # MLP FC1
@@ -920,6 +951,8 @@ class H3TransformerBlock(torch.nn.Module):
             device=self.device,
             dtype=torch.float32,
         )
+        if self.print_internal_diagnostics:
+            _print_tensor_summary("B2 FC1 before LoRA", fc1_output)
 
         del fc1_cpu
 
@@ -932,6 +965,8 @@ class H3TransformerBlock(torch.nn.Module):
             )
         if self.lora is not None:
             self.lora.add_linear("fc1", normalized, fc1_output)
+        if self.print_internal_diagnostics:
+            _print_tensor_summary("B2 FC1 after LoRA", fc1_output)
         del normalized
 
         # ----------------------------------------------------
@@ -939,6 +974,8 @@ class H3TransformerBlock(torch.nn.Module):
         # ----------------------------------------------------
 
         mlp_hidden = swiglu(fc1_output)
+        if self.print_internal_diagnostics:
+            _print_tensor_summary("B2 SwiGLU", mlp_hidden)
 
         del fc1_output
 
@@ -952,8 +989,12 @@ class H3TransformerBlock(torch.nn.Module):
             device=self.device,
             dtype=torch.float32,
         )
+        if self.print_internal_diagnostics:
+            _print_tensor_summary("B2 FC2 before LoRA", mlp_output)
         if self.lora is not None:
             self.lora.add_linear("fc2", mlp_hidden, mlp_output)
+        if self.print_internal_diagnostics:
+            _print_tensor_summary("B2 FC2 after LoRA", mlp_output)
 
         del fc2_cpu, mlp_hidden
 
