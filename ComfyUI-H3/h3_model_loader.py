@@ -282,6 +282,7 @@ class H3Transformer(torch.nn.Module):
         audio_shift=3.0,
         trim_working_set=False,
         trim_interval_blocks=10,
+        sampler="euler",
     ):
         """Execute joint H3 denoising through this ComfyUI-managed transformer."""
         import gc
@@ -325,6 +326,7 @@ class H3Transformer(torch.nn.Module):
                     video_shift=video_shift,
                     audio_shift=audio_shift,
                     progress_callback=progress_callback,
+                    sampler=sampler,
                 )
             finally:
                 if engine is not None:
