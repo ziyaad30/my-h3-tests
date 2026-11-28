@@ -348,24 +348,48 @@ class Encoder(H3Module):
     def forward(self, video):
         if video.ndim != 5 or video.shape[1] != 3 or video.shape[-2] % 16 or video.shape[-1] % 16:
             raise ValueError("H3 input must be RGB [B,3,T,H,W] with spatial dimensions divisible by 16")
-        frames = padded_frames("h3", video.shape[2])
-        window_frames = math.ceil(frames / 17) * 17
-        video = torch.cat((video, video[:, :, -1:].expand(-1, -1, window_frames - video.shape[2], -1, -1)), dim=2)
         heights, height_overlaps = split_tiles(video.shape[-2], self.tile_size, self.tile_overlap)
         widths, width_overlaps = split_tiles(video.shape[-1], self.tile_size, self.tile_overlap)
-        output = []
-        for begin in range(0, window_frames, 17):
+
+        if video.shape[2] == 1:
+            # Match ComfyUI's native MiniMaxH3VideoVAE.encode still-image path:
+            # encode the single frame directly, then retain its single temporal latent.
             rows = []
             for h in heights:
                 row = []
                 for w in widths:
-                    clip = video[:, :, begin:begin + 17, h.start * 16:h.stop * 16, w.start * 16:w.stop * 16]
-                    row.append(self._encode_clip(clip))
+                    tile = video[:, :, :, h.start * 16:h.stop * 16, w.start * 16:w.stop * 16]
+                    row.append(self._encode_clip(tile))
                 rows.append(row)
-            output.append(stitch_tiles(rows, [v // 16 for v in height_overlaps], [v // 16 for v in width_overlaps]))
-        moments = torch.cat(output, dim=2)[:, :, :-3]
-        if moments.shape[2] != latent_frames("h3", frames):
-            raise RuntimeError("H3 encoder produced the wrong latent frame count")
+            moments = stitch_tiles(
+                rows,
+                [v // 16 for v in height_overlaps],
+                [v // 16 for v in width_overlaps],
+            )[:, :, -1:]
+        else:
+            frames = padded_frames("h3", video.shape[2])
+            window_frames = math.ceil(frames / 17) * 17
+            video = torch.cat(
+                (video, video[:, :, -1:].expand(-1, -1, window_frames - video.shape[2], -1, -1)),
+                dim=2,
+            )
+            output = []
+            for begin in range(0, window_frames, 17):
+                rows = []
+                for h in heights:
+                    row = []
+                    for w in widths:
+                        clip = video[:, :, begin:begin + 17, h.start * 16:h.stop * 16, w.start * 16:w.stop * 16]
+                        row.append(self._encode_clip(clip))
+                    rows.append(row)
+                output.append(stitch_tiles(
+                    rows,
+                    [v // 16 for v in height_overlaps],
+                    [v // 16 for v in width_overlaps],
+                ))
+            moments = torch.cat(output, dim=2)[:, :, :-3]
+            if moments.shape[2] != latent_frames("h3", frames):
+                raise RuntimeError("H3 encoder produced the wrong latent frame count")
         posterior_mean = moments[:, :self.latent_channels].float()
         mean = self.latents_mean.float().view(1, -1, 1, 1, 1)
         std = self.latents_std.float().view(1, -1, 1, 1, 1)
