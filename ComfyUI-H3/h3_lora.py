@@ -42,6 +42,25 @@ class H3LoRABlock:
         self.pairs = pairs
         self.scales = {name: float(value) for name, value in scales.items()}
         self.device = torch.device(device)
+        self.print_diagnostics = False
+
+    @staticmethod
+    def _print_delta(label, delta):
+        sum_sq = torch.zeros((), device=delta.device, dtype=torch.float32)
+        max_abs = torch.zeros((), device=delta.device, dtype=torch.float32)
+        count = 0
+        for first in range(0, delta.shape[0], 128):
+            value = delta[first:first + 128].detach().float()
+            sum_sq += value.square().sum()
+            max_abs = torch.maximum(max_abs, value.abs().max())
+            count += value.numel()
+        if count:
+            print(
+                f"[H3 LoRA delta] {label:<24} "
+                f"rms={torch.sqrt(sum_sq / count).item():.5g} "
+                f"max_abs={max_abs.item():.5g}",
+                flush=True,
+            )
 
     @torch.inference_mode()
     def _delta(self, x, target):
@@ -68,7 +87,11 @@ class H3LoRABlock:
         for index, target in enumerate(("attn.to_q", "attn.to_k", "attn.to_v")):
             start = index * ATTENTION
             end = start + ATTENTION
-            output[:, start:end].add_(self._delta(x, target))
+            delta = self._delta(x, target)
+            if self.print_diagnostics:
+                self._print_delta(target, delta)
+            output[:, start:end].add_(delta)
+            del delta
         return output
 
     @torch.inference_mode()
@@ -81,6 +104,8 @@ class H3LoRABlock:
         if target is None:
             raise KeyError(f"Unknown H3 LoRA projection: {name}")
         delta = self._delta(x, target)
+        if self.print_diagnostics:
+            self._print_delta(target, delta)
         if delta.shape != output.shape:
             raise ValueError(
                 f"LoRA {name} delta {tuple(delta.shape)} "
