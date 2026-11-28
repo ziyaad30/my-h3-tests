@@ -252,7 +252,7 @@ class H3VideoVAEEncodeLight:
         model = encoder.model
         frame_count = int(video.shape[2])
         padded_count = padded_frames("h3", frame_count)
-        expected_latent_frames = latent_frames("h3", padded_count)
+        # A still image uses the native H3 single-image path (T=1); only\n        # multi-frame input follows the video 5*n+2 temporal latent grid.\n        expected_latent_frames = (\n            1 if frame_count == 1 else latent_frames("h3", padded_count)\n        )
         log.info(
             "Encoding %d H3 frames (%d padded) at %dx%d with LightVAE-Lite",
             frame_count, padded_count, width, height,
@@ -262,7 +262,7 @@ class H3VideoVAEEncodeLight:
         # spatial tiles so ComfyUI can show real node execution progress.
         import comfy.utils
 
-        window_frames = ((padded_count + 16) // 17) * 17
+        window_frames = (\n            1 if frame_count == 1 else ((padded_count + 16) // 17) * 17\n        )
         height_tiles, _ = split_tiles(height, model.tile_size, model.tile_overlap)
         width_tiles, _ = split_tiles(width, model.tile_size, model.tile_overlap)
         clips = (window_frames // 17) * len(height_tiles) * len(width_tiles)
