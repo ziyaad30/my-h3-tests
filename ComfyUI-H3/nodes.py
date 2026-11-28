@@ -5,6 +5,7 @@ from .h3_model_loader import H3ModelLoader
 from .h3_sampler import H3Sampler
 from .h3_sampler_beta import H3SamplerBeta
 from .h3_sampler_res_multistep import H3SamplerResMultistep
+from .h3_sampler_res_multistep_latent import H3SamplerResMultistepLatent
 from .h3_sampler_fl2va_beta import H3SamplerFL2VABeta
 from .h3_lora import H3LoRALoader
 from .h3_video_vae import H3VideoVAELoader, H3VideoVAEDecode
@@ -19,6 +20,7 @@ NODE_CLASS_MAPPINGS = {
     "H3Sampler": H3Sampler,
     "H3SamplerBeta": H3SamplerBeta,
     "H3SamplerResMultistep": H3SamplerResMultistep,
+    "H3SamplerResMultistepLatent": H3SamplerResMultistepLatent,
     "H3SamplerFL2VABeta": H3SamplerFL2VABeta,
     "H3LoRALoader": H3LoRALoader,
     "H3VideoVAELoader": H3VideoVAELoader,
@@ -35,6 +37,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3Sampler": "H3 Sampler",
     "H3SamplerBeta": "H3 Sampler (Beta)",
     "H3SamplerResMultistep": "H3 Sampler (RES Multistep Experimental)",
+    "H3SamplerResMultistepLatent": "H3 Sampler (RES Multistep - Native VAE Latents)",
     "H3SamplerFL2VABeta": "H3 Sampler (FL2VA Beta)",
     "H3LoRALoader": "H3 LoRA Loader",
     "H3VideoVAELoader": "H3 Video VAE",
