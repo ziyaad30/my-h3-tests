@@ -425,6 +425,7 @@ def _print_tensor_summary(label, tensor):
     sum_sq = torch.zeros((), device=tensor.device, dtype=torch.float64)
     maximum = torch.tensor(float("-inf"), device=tensor.device)
     minimum = torch.tensor(float("inf"), device=tensor.device)
+    max_abs = torch.zeros((), device=tensor.device)
     count = 0
     chunk_rows = 8
     for first in range(0, tensor.shape[0], chunk_rows):
@@ -433,12 +434,13 @@ def _print_tensor_summary(label, tensor):
         sum_sq += value.square().sum(dtype=torch.float64)
         maximum = torch.maximum(maximum, value.max())
         minimum = torch.minimum(minimum, value.min())
+        max_abs = torch.maximum(max_abs, value.abs().max())
         count += value.numel()
     print(
         f"[H3 B2 internals] {label:<30} "
         f"rms={torch.sqrt(sum_sq / count).item():.5g} "
         f"mean_abs={(sum_abs / count).item():.5g} "
-        f"max_abs={maximum.abs().item():.5g} "
+        f"max_abs={max_abs.item():.5g} "
         f"min={minimum.item():.5g} max={maximum.item():.5g}",
         flush=True,
     )
@@ -829,6 +831,9 @@ class H3TransformerBlock(torch.nn.Module):
         if self.lora is not None:
             self.lora.add_qkv(normalized, qkv)
 
+        if self.print_internal_diagnostics:
+            _print_tensor_summary("B2 QKV after LoRA", qkv)
+
         qkv = qkv.reshape(
             token_count,
             3,
@@ -879,6 +884,8 @@ class H3TransformerBlock(torch.nn.Module):
             query_chunk=self.query_chunk,
             key_chunk=self.key_chunk,
         )
+        if self.print_internal_diagnostics:
+            _print_tensor_summary("B2 attention result", attention)
 
         del q, k, v, cos, sin
 
@@ -897,8 +904,12 @@ class H3TransformerBlock(torch.nn.Module):
             device=self.device,
             dtype=torch.float32,
         )
+        if self.print_internal_diagnostics:
+            _print_tensor_summary("B2 out_proj before LoRA", attention_output)
         if self.lora is not None:
             self.lora.add_linear("out_proj", attention, attention_output)
+        if self.print_internal_diagnostics:
+            _print_tensor_summary("B2 out_proj after LoRA", attention_output)
 
         del attention_cpu, attention
 
