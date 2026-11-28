@@ -15,6 +15,11 @@ import numpy as np
 import torch
 from PIL import Image
 
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
 from minimax_h3_lightvae_encoder import (
     DEVICE,
     encode_keyframe_latent,
@@ -37,6 +42,10 @@ OUTPUT_DIR = ROOT / "lightvae_roundtrip_test"
 # ComfyUI-style generation dimensions.
 WIDTH = 448
 HEIGHT = 256
+
+# Resize algorithm used when the source image does not match WIDTH x HEIGHT.
+# Options: "opencv_area", "opencv_lanczos4", "pillow_lanczos".
+RESIZE_METHOD = "opencv_area"
 
 # H3 accepts one still frame, or video lengths following 17*n + 5.
 # 5 is the shortest valid H3 video; 22 gives a more useful temporal test.
@@ -65,16 +74,55 @@ def validate_settings():
 
 
 def load_source_image():
-    # if not INPUT_IMAGE_PATH.is_file():
-    #     raise FileNotFoundError(
-    #         f"Input image not found: {INPUT_IMAGE_PATH}\n"
-    #         "Place one image named input.png beside this script."
-    #     )
-
     with Image.open(INPUT_IMAGE_PATH) as source:
         image = source.convert("RGB")
 
-    image = image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+    if image.size != (WIDTH, HEIGHT):
+        if RESIZE_METHOD == "opencv_area":
+            if cv2 is None:
+                raise RuntimeError(
+                    "RESIZE_METHOD='opencv_area' requires OpenCV. "
+                    "Install opencv-python or select another resize method."
+                )
+            # INTER_AREA is intended for image reduction. For enlargement,
+            # use INTER_CUBIC instead.
+            if WIDTH <= image.width and HEIGHT <= image.height:
+                interpolation = cv2.INTER_AREA
+            else:
+                interpolation = cv2.INTER_CUBIC
+
+            resized = cv2.resize(
+                np.asarray(image),
+                (WIDTH, HEIGHT),
+                interpolation=interpolation,
+            )
+            image = Image.fromarray(resized)
+
+        elif RESIZE_METHOD == "opencv_lanczos4":
+            if cv2 is None:
+                raise RuntimeError(
+                    "RESIZE_METHOD='opencv_lanczos4' requires OpenCV. "
+                    "Install opencv-python or select another resize method."
+                )
+            resized = cv2.resize(
+                np.asarray(image),
+                (WIDTH, HEIGHT),
+                interpolation=cv2.INTER_LANCZOS4,
+            )
+            image = Image.fromarray(resized)
+
+        elif RESIZE_METHOD == "pillow_lanczos":
+            image = image.resize(
+                (WIDTH, HEIGHT),
+                Image.Resampling.LANCZOS,
+            )
+
+        else:
+            raise ValueError(
+                f"Unknown RESIZE_METHOD: {RESIZE_METHOD!r}. "
+                "Choose 'opencv_area', 'opencv_lanczos4', or 'pillow_lanczos'."
+            )
+
     array = np.asarray(image, dtype=np.float32) / 127.5 - 1.0
     tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0).unsqueeze(2)
     return image, tensor.contiguous()
@@ -125,6 +173,7 @@ def main():
     # print("Input image:", INPUT_IMAGE_PATH.resolve())
     print("Requested width:", WIDTH)
     print("Requested height:", HEIGHT)
+    print("Resize method:", RESIZE_METHOD)
     print("Requested length:", LENGTH)
     print("Batch size:", BATCH_SIZE)
     print("FPS:", FPS)
