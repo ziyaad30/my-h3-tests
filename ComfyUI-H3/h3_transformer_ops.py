@@ -420,20 +420,87 @@ def streamed_attention(
 # ============================================================
 
 def _print_residual_modality_stats(label, tensor, token_tags):
-    """Print compact branch statistics for video/audio tokens only."""
+    """Print compact video/audio statistics without copying full token streams."""
+    chunk_size = 64
     for modality_name, modality_id in (("video", VIDEO), ("audio", AUDIO)):
-        mask = token_tags == modality_id
-        if not bool(mask.any().item()):
-            continue
-        value = tensor[mask].detach().float()
-        rms = torch.sqrt(torch.mean(value.square())).item()
-        mean_abs = value.abs().mean().item()
-        max_abs = value.abs().max().item()
-        print(
-            f"[H3 residual] B{label} {modality_name:<5} "
-            f"rms={rms:.5g} mean_abs={mean_abs:.5g} max_abs={max_abs:.5g}",
-            flush=True,
-        )
+        sum_abs = None
+        sum_sq = None
+        max_abs = None
+        count = 0
+        for first in range(0, tensor.shape[0], chunk_size):
+            last = min(first + chunk_size, tensor.shape[0])
+            mask = token_tags[first:last] == modality_id
+            if not bool(mask.any().item()):
+                continue
+            value = tensor[first:last][mask].detach().float()
+            sum_abs_part = value.abs().sum()
+            sum_sq_part = value.square().sum()
+            max_abs_part = value.abs().max()
+            sum_abs = sum_abs_part if sum_abs is None else sum_abs + sum_abs_part
+            sum_sq = sum_sq_part if sum_sq is None else sum_sq + sum_sq_part
+            max_abs = max_abs_part if max_abs is None else torch.maximum(max_abs, max_abs_part)
+            count += value.numel()
+        if count:
+            mean_abs = (sum_abs / count).item()
+            rms = torch.sqrt(sum_sq / count).item()
+            maximum = max_abs.item()
+            print(
+                f"[H3 residual] B{label} {modality_name:<5} "
+                f"rms={rms:.5g} mean_abs={mean_abs:.5g} max_abs={maximum:.5g}",
+                flush=True,
+            )
+
+
+def _print_residual_gate_stats(
+    label, modulation_table, adaln_indices, gate_group,
+    branch_output, token_tags,
+):
+    """Stream gate/contribution statistics in small token chunks."""
+    chunk_size = 64
+    for modality_name, modality_id in (("video", VIDEO), ("audio", AUDIO)):
+        gate_sum_abs = gate_sum_sq = gate_max_abs = None
+        contribution_sum_abs = contribution_sum_sq = contribution_max_abs = None
+        count = 0
+        for first in range(0, adaln_indices.numel(), chunk_size):
+            last = min(first + chunk_size, adaln_indices.numel())
+            mask = token_tags[first:last] == modality_id
+            if not bool(mask.any().item()):
+                continue
+            local_indices = adaln_indices[first:last][mask]
+            gate = modulation_table.index_select(0, local_indices)[:, gate_group, :]
+            branch = branch_output[first:last][mask]
+            contribution = gate * branch
+
+            ga = gate.abs()
+            ca = contribution.abs()
+            part = (
+                ga.sum(), gate.square().sum(), ga.max(),
+                ca.sum(), contribution.square().sum(), ca.max(),
+            )
+            if gate_sum_abs is None:
+                gate_sum_abs, gate_sum_sq, gate_max_abs = part[:3]
+                contribution_sum_abs, contribution_sum_sq, contribution_max_abs = part[3:]
+            else:
+                gate_sum_abs = gate_sum_abs + part[0]
+                gate_sum_sq = gate_sum_sq + part[1]
+                gate_max_abs = torch.maximum(gate_max_abs, part[2])
+                contribution_sum_abs = contribution_sum_abs + part[3]
+                contribution_sum_sq = contribution_sum_sq + part[4]
+                contribution_max_abs = torch.maximum(contribution_max_abs, part[5])
+            count += gate.numel()
+
+        if count:
+            for name, total_abs, total_sq, maximum in (
+                ("gate", gate_sum_abs, gate_sum_sq, gate_max_abs),
+                ("contribution", contribution_sum_abs, contribution_sum_sq, contribution_max_abs),
+            ):
+                print(
+                    f"[H3 residual] B{label} {modality_name:<5} {name:<12} "
+                    f"rms={torch.sqrt(total_sq / count).item():.5g} "
+                    f"mean_abs={(total_abs / count).item():.5g} "
+                    f"max_abs={maximum.item():.5g}",
+                    flush=True,
+                )
 
 
 class H3TransformerBlock(torch.nn.Module):
@@ -799,21 +866,14 @@ class H3TransformerBlock(torch.nn.Module):
 
         if self.print_residual_diagnostics:
             token_tags = torch.remainder(adaln_indices, 3)
-            selected = modulation_table.index_select(0, adaln_indices)
-            attention_gate = selected[:, 2, :]
-            attention_contribution = attention_gate * attention_output
             block_label = self.block_index + 1
             _print_residual_modality_stats(
                 f"{block_label} attention_branch", attention_output, token_tags
             )
-            _print_residual_modality_stats(
-                f"{block_label} attention_gate", attention_gate, token_tags
+            _print_residual_gate_stats(
+                block_label, modulation_table, adaln_indices, 2,
+                attention_output, token_tags
             )
-            _print_residual_modality_stats(
-                f"{block_label} attention_contribution",
-                attention_contribution, token_tags
-            )
-            del selected, attention_gate, attention_contribution
 
         x = apply_adaln_gated_residual(
             x,
@@ -902,21 +962,14 @@ class H3TransformerBlock(torch.nn.Module):
         # ----------------------------------------------------
 
         if self.print_residual_diagnostics:
-            selected = modulation_table.index_select(0, adaln_indices)
-            mlp_gate = selected[:, 5, :]
-            mlp_contribution = mlp_gate * mlp_output
             block_label = self.block_index + 1
             _print_residual_modality_stats(
                 f"{block_label} mlp_branch", mlp_output, token_tags
             )
-            _print_residual_modality_stats(
-                f"{block_label} mlp_gate", mlp_gate, token_tags
+            _print_residual_gate_stats(
+                block_label, modulation_table, adaln_indices, 5,
+                mlp_output, token_tags
             )
-            _print_residual_modality_stats(
-                f"{block_label} mlp_contribution",
-                mlp_contribution, token_tags
-            )
-            del selected, mlp_gate, mlp_contribution
 
         output = apply_adaln_gated_residual(
             x,
