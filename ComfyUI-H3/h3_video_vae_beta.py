@@ -118,6 +118,28 @@ def _h3_position_aware_decode_pixels(
     )
 
 
+def _h3_decode_tile_row(self, z_row, x_idx, x_len, full_dims, zi):
+    """Retain ComfyUI's memory-aware tile batching while passing global offsets."""
+    import comfy.model_management
+
+    free = comfy.model_management.get_free_memory(z_row.device)
+    batch = int(max(1, min(4, free // (128 * 2**20 * z_row.shape[0]))))
+    slices = [
+        z_row[..., j_pos // self.vae_ratio:(j_pos + j_len) // self.vae_ratio]
+        for j_pos, j_len in zip(x_idx, x_len)
+    ]
+    offsets = [
+        (0, zi, j_pos // self.vae_ratio) for j_pos in x_idx
+    ]
+    for start in range(0, len(slices), batch):
+        group = slices[start:start + batch]
+        group_offsets = offsets[start:start + batch]
+        decoded = self._decode_pixels(
+            torch.cat(group), full_dims=full_dims, offsets=group_offsets
+        )
+        yield from decoded.chunk(len(group))
+
+
 def _h3_tiled_decode(self, z, frames=slice(None)):
     """H3 spatial tiling with global RoPE coordinates and continuous blending.
 
@@ -143,16 +165,12 @@ def _h3_tiled_decode(self, z, frames=slice(None)):
         left_tail = None
         out_x = 0
         tile_height = 0
+        tiles = self._decode_tile_row(
+            z[..., zi:zi + zl, :], x_idx, x_len, full_dims, zi
+        )
 
-        for j, (j_pos, j_len) in enumerate(zip(x_idx, x_len)):
-            zj = j_pos // ratio
-            zw = j_len // ratio
-            tile_latent = z[..., zi:zi + zl, zj:zj + zw]
-            tile = self._decode_pixels(
-                tile_latent,
-                full_dims=full_dims,
-                offsets=(0, zi, zj),
-            )[:, :, frames]
+        for j in range(len(x_idx)):
+            tile = next(tiles)[:, :, frames]
 
             if i > 0:
                 previous_row = strip[..., :, x_idx[j]:x_idx[j] + x_len[j]]
@@ -201,7 +219,7 @@ def _h3_tiled_decode(self, z, frames=slice(None)):
             ].copy_(tile)
             tile_height = tile.shape[-2]
             out_x += tile.shape[-1]
-            del tile, tile_latent
+            del tile
 
         strip = new_strip
         out_y += tile_height
@@ -354,6 +372,9 @@ class H3VideoVAEDecodeBeta:
             )
             patched_methods.append(
                 install_method(first_stage, "tiled_decode", _h3_tiled_decode)
+            )
+            patched_methods.append(
+                install_method(first_stage, "_decode_tile_row", _h3_decode_tile_row)
             )
 
             first_stage.tiling = bool(tiling)
