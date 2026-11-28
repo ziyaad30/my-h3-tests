@@ -283,6 +283,10 @@ class H3Transformer(torch.nn.Module):
         trim_working_set=False,
         trim_interval_blocks=10,
         sampler="euler",
+        print_tensor_stats=False,
+        print_block_progress=True,
+        print_memory_stats=False,
+        print_sampler_diagnostics=False,
     ):
         """Execute joint H3 denoising through this ComfyUI-managed transformer."""
         import gc
@@ -314,6 +318,9 @@ class H3Transformer(torch.nn.Module):
                     fps=fps,
                     trim_working_set=trim_working_set,
                     trim_interval_blocks=trim_interval_blocks,
+                    print_tensor_stats=print_tensor_stats,
+                    print_block_progress=print_block_progress,
+                    print_memory_stats=print_memory_stats,
                 )
                 return run_h3_sampling(
                     engine=engine,
@@ -327,6 +334,8 @@ class H3Transformer(torch.nn.Module):
                     audio_shift=audio_shift,
                     progress_callback=progress_callback,
                     sampler=sampler,
+                    print_sampler_diagnostics=print_sampler_diagnostics,
+                    print_tensor_stats=print_tensor_stats,
                 )
             finally:
                 if engine is not None:
