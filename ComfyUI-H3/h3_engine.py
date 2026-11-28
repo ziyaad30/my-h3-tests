@@ -470,15 +470,7 @@ def validate_checkpoint(gguf: GGUF) -> None:
         name for name in core_matrix_names
         if gguf.tensors[name].ggml_type == TYPE_Q3_K
     ]
-    if q2k_core:
-        print(
-            "[H3 checkpoint warning] "
-            f"{len(q2k_core)}/{len(core_matrix_names)} core block matrices use Q2_K. "
-            "This very-low-bit H3 quantization is documented to produce broken video/audio. "
-            "Use Q3_K or a higher-quality quantization when possible; streamed Q3_K is supported.",
-            flush=True,
-        )
-    elif q3k_core:
+    if q3k_core:
         print(
             f"[H3 checkpoint] {len(q3k_core)}/{len(core_matrix_names)} core block matrices use Q3_K.",
             flush=True,
