@@ -27,7 +27,7 @@ class H3SamplerBeta:
                 "height": ("INT", {"default": 256, "min": 32, "max": 4096, "step": 32}),
                 "frames": ("INT", {"default": 22, "min": 5, "max": 1000, "step": 17}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 120.0, "step": 0.1}),
-                "steps": ("INT", {"default": 7, "min": 1, "max": 100}),
+                "steps": ("INT", {"default": 50, "min": 1, "max": 100}),
                 "trim_working_set": ("BOOLEAN", {"default": False}),
                 "trim_interval_blocks": ("INT", {"default": 10, "min": 1, "max": 50}),
                 "video_shift": ("FLOAT", {"default": 12.0, "min": 0.01, "max": 100.0, "step": 0.01}),
