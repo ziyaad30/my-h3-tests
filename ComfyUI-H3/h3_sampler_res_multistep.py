@@ -162,7 +162,7 @@ class H3SamplerResMultistep:
             gc.collect()
             _check_interrupted()
             print(
-                f"[H3 Sampler Beta] Joint audio/video sampling completed in {elapsed:.2f}s.",
+                f"[H3 Sampler RES Multistep] Joint audio/video sampling completed in {elapsed:.2f}s.",
                 flush=True,
             )
             return (
