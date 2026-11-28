@@ -57,10 +57,13 @@ DEFAULT_GGUF = (
 TYPE_F32 = 0
 TYPE_F16 = 1
 TYPE_Q2_K = 10
+TYPE_Q3_K = 11
 TYPE_BF16 = 30
 
 Q2K_BLOCK_ELEMENTS = 256
 Q2K_BLOCK_BYTES = 84
+Q3K_BLOCK_ELEMENTS = 256
+Q3K_BLOCK_BYTES = 110
 
 # Measured on the GTX 1650:
 # 2048 was fastest in both streamed linear and transformer
@@ -293,13 +296,13 @@ class GGUF:
 
         if t.ggml_type == TYPE_Q2_K:
             if n % Q2K_BLOCK_ELEMENTS:
-                raise ValueError(
-                    f"Q2_K element count not divisible by 256: {t.name}"
-                )
+                raise ValueError(f"Q2_K element count not divisible by 256: {t.name}")
+            return (n // Q2K_BLOCK_ELEMENTS) * Q2K_BLOCK_BYTES
 
-            return (
-                n // Q2K_BLOCK_ELEMENTS
-            ) * Q2K_BLOCK_BYTES
+        if t.ggml_type == TYPE_Q3_K:
+            if n % Q3K_BLOCK_ELEMENTS:
+                raise ValueError(f"Q3_K element count not divisible by 256: {t.name}")
+            return (n // Q3K_BLOCK_ELEMENTS) * Q3K_BLOCK_BYTES
 
         raise ValueError(
             f"Unsupported GGML type {t.ggml_type}: {t.name}"
@@ -408,13 +411,13 @@ class GGUF:
 
         if t.ggml_type == TYPE_Q2_K:
             if width % Q2K_BLOCK_ELEMENTS:
-                raise ValueError(
-                    f"Invalid Q2_K input width: {name}"
-                )
+                raise ValueError(f"Invalid Q2_K input width: {name}")
+            bytes_per_row = (width // Q2K_BLOCK_ELEMENTS) * Q2K_BLOCK_BYTES
 
-            bytes_per_row = (
-                width // Q2K_BLOCK_ELEMENTS
-            ) * Q2K_BLOCK_BYTES
+        elif t.ggml_type == TYPE_Q3_K:
+            if width % Q3K_BLOCK_ELEMENTS:
+                raise ValueError(f"Invalid Q3_K input width: {name}")
+            bytes_per_row = (width // Q3K_BLOCK_ELEMENTS) * Q3K_BLOCK_BYTES
 
         elif t.ggml_type == TYPE_F32:
             bytes_per_row = width * 4
@@ -707,16 +710,119 @@ def _decode_q2k_torch(raw, row_count, input_width, device):
 
 
 # ============================================================
+# Q3_K DECODER (CPU STREAMING PATH)
+# ============================================================
+
+def decode_q3k_reference(raw):
+    """Straightforward Q3_K reference decoder following ggml dequantize_row_q3_K."""
+    if len(raw) % Q3K_BLOCK_BYTES:
+        raise ValueError("Invalid Q3_K byte count")
+    blocks = np.frombuffer(raw, dtype=np.uint8).reshape(-1, Q3K_BLOCK_BYTES)
+    output = np.empty((blocks.shape[0], 256), dtype=np.float32)
+
+    for b in range(blocks.shape[0]):
+        block = blocks[b]
+        d = np.frombuffer(block[108:110].tobytes(), dtype="<f2")[0].astype(np.float32)
+        scale_bytes = block[96:108]
+        scales = []
+        for i in range(16):
+            low = int(scale_bytes[i] & 15) if i < 8 else int(scale_bytes[i - 8] >> 4)
+            high = (int(scale_bytes[8 + (i % 4)]) >> (2 * (i // 4))) & 3
+            scales.append((low | (high << 4)) - 32)
+
+        out_index = 0
+        qbase = 0
+        mask = 1
+        scale_index = 0
+        for _chunk in range(2):
+            shift = 0
+            for _group in range(4):
+                for half in range(2):
+                    multiplier = np.float32(d * np.float32(scales[scale_index]))
+                    scale_index += 1
+                    qstart = 32 + qbase + half * 16
+                    hstart = half * 16
+                    for lane in range(16):
+                        low_quant = (int(block[qstart + lane]) >> shift) & 3
+                        high_quant = 0 if (int(block[hstart + lane]) & mask) else 4
+                        output[b, out_index] = multiplier * np.float32(low_quant - high_quant)
+                        out_index += 1
+                shift += 2
+                mask <<= 1
+            qbase += 32
+        if out_index != 256 or scale_index != 16:
+            raise RuntimeError("Q3_K reference decoder layout error")
+
+    return output.reshape(-1)
+
+
+@njit(cache=True, parallel=True)
+def _decode_q3k_numba_kernel(blocks):
+    output = np.empty(blocks.shape[0] * 256, dtype=np.float32)
+    for b in prange(blocks.shape[0]):
+        d = np.float32(np.frombuffer(blocks[b, 108:110].tobytes(), dtype=np.float16)[0])
+        scales = np.empty(16, dtype=np.int32)
+        for i in range(16):
+            low = int(blocks[b, 96 + i] & 15) if i < 8 else int(blocks[b, 96 + i - 8] >> 4)
+            high = (int(blocks[b, 104 + (i % 4)]) >> (2 * (i // 4))) & 3
+            scales[i] = (low | (high << 4)) - 32
+
+        out_index = 0
+        qbase = 0
+        mask = 1
+        scale_index = 0
+        for _chunk in range(2):
+            shift = 0
+            for _group in range(4):
+                for half in range(2):
+                    multiplier = np.float32(d * np.float32(scales[scale_index]))
+                    scale_index += 1
+                    qstart = 32 + qbase + half * 16
+                    hstart = half * 16
+                    for lane in range(16):
+                        low_quant = (int(blocks[b, qstart + lane]) >> shift) & 3
+                        high_quant = 0 if (int(blocks[b, hstart + lane]) & mask) else 4
+                        output[b * 256 + out_index] = multiplier * np.float32(low_quant - high_quant)
+                        out_index += 1
+                shift += 2
+                mask <<= 1
+            qbase += 32
+    return output
+
+
+def decode_q3k(raw):
+    """Decode GGML Q3_K blocks (256 values / 110 bytes) with the Numba CPU kernel."""
+    if isinstance(raw, (bytes, bytearray, memoryview)):
+        raw = np.frombuffer(raw, dtype=np.uint8)
+    else:
+        raw = np.asarray(raw, dtype=np.uint8).reshape(-1)
+    if raw.size % Q3K_BLOCK_BYTES:
+        raise ValueError(f"Invalid Q3_K data size: {raw.size} bytes; expected a multiple of 110.")
+    block_count = raw.size // Q3K_BLOCK_BYTES
+    blocks = np.ascontiguousarray(raw.reshape(block_count, Q3K_BLOCK_BYTES))
+    return _decode_q3k_numba_kernel(blocks)
+
+
+def test_q3k_decoder():
+    rng = np.random.default_rng(1234)
+    raw = rng.integers(0, 256, size=Q3K_BLOCK_BYTES * 8, dtype=np.uint8)
+    expected = decode_q3k_reference(raw.tobytes())
+    actual = decode_q3k(raw)
+    np.testing.assert_allclose(actual, expected, rtol=0, atol=0)
+    print("Q3_K reference/Numba decoder parity: PASSED")
+
+
+# ============================================================
 # OTHER GGML WEIGHT DECODERS
 # ============================================================
 
 def decode_weight_tile(raw, ggml_type, row_count, input_width):
 
     if ggml_type == TYPE_Q2_K:
-        return decode_q2k(raw).reshape(
-            row_count,
-            input_width,
-        )
+        return decode_q2k(raw).reshape(row_count, input_width)
+
+    if ggml_type == TYPE_Q3_K:
+        return decode_q3k(raw).reshape(row_count, input_width)
 
     if ggml_type == TYPE_F32:
         return np.frombuffer(
@@ -812,13 +918,10 @@ class TiledGGUFLinear(torch.nn.Module):
                 "token_tile must be positive"
             )
 
-        if (
-            self.ggml_type == TYPE_Q2_K
-            and self.input_width % Q2K_BLOCK_ELEMENTS
-        ):
-            raise ValueError(
-                f"Q2_K input width is not block-aligned: {self.name}"
-            )
+        if self.ggml_type == TYPE_Q2_K and self.input_width % Q2K_BLOCK_ELEMENTS:
+            raise ValueError(f"Q2_K input width is not block-aligned: {self.name}")
+        if self.ggml_type == TYPE_Q3_K and self.input_width % Q3K_BLOCK_ELEMENTS:
+            raise ValueError(f"Q3_K input width is not block-aligned: {self.name}")
 
         self.row_tile = (
             max(
