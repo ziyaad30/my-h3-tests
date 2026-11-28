@@ -763,9 +763,15 @@ def _decode_q3k_numba_kernel(blocks, d_values):
         d = d_values[b]
         scales = np.empty(16, dtype=np.int32)
         for i in range(16):
-            low = int(blocks[b, 96 + i] & 15) if i < 8 else int(blocks[b, 96 + i - 8] >> 4)
-            high = (int(blocks[b, 104 + (i % 4)]) >> (2 * (i // 4))) & 3
-            scales[i] = (low | (high << 4)) - 32
+            if i < 8:
+                low = np.int32(blocks[b, 96 + i]) & np.int32(15)
+            else:
+                low = np.int32(blocks[b, 96 + i - 8]) >> np.int32(4)
+            high = (
+                np.int32(blocks[b, 104 + (i % 4)])
+                >> np.int32(2 * (i // 4))
+            ) & np.int32(3)
+            scales[i] = low + high * np.int32(16) - np.int32(32)
 
         out_index = 0
         qbase = 0
@@ -809,6 +815,9 @@ def decode_q3k(raw):
 def test_q3k_decoder():
     rng = np.random.default_rng(1234)
     raw = rng.integers(0, 256, size=Q3K_BLOCK_BYTES * 8, dtype=np.uint8)
+    blocks = raw.reshape(-1, Q3K_BLOCK_BYTES)
+    scales = rng.uniform(0.01, 1.0, size=blocks.shape[0]).astype("<f2")
+    blocks[:, 108:110] = scales.view(np.uint8).reshape(-1, 2)
     expected = decode_q3k_reference(raw.tobytes())
     actual = decode_q3k(raw)
     np.testing.assert_allclose(actual, expected, rtol=0, atol=0)
