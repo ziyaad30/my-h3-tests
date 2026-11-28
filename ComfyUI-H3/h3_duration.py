@@ -1,8 +1,7 @@
 """Duration calculator for MiniMax H3 frame counts.
 
-Returns both the direct seconds * FPS frame count and the nearest temporal
-length accepted by the current H3 sampler (5 + 17*n). The requested frame
-count is never clamped to the sampler's present UI maximum.
+Converts a duration to the nearest temporal length accepted by the current
+H3 sampler (5 + 17*n).
 """
 
 import math
@@ -34,20 +33,17 @@ class H3SecondsToFrames:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "seconds": ("FLOAT", {"default": 30.0, "min": 0.001, "step": 0.1}),
+                "seconds": ("FLOAT", {"default": 4.0, "min": 0.001, "step": 0.1}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 0.001, "step": 0.1}),
             }
         }
 
-    RETURN_TYPES = ("INT", "INT", "FLOAT")
-    RETURN_NAMES = ("requested_frames", "h3_compatible_frames", "actual_seconds")
+    RETURN_TYPES = ("INT",)
+    RETURN_NAMES = ("frames",)
     FUNCTION = "calculate"
     CATEGORY = "MiniMax H3/Utilities"
-    DESCRIPTION = (
-        "Converts any positive duration to frames. Also reports the nearest "
-        "frame count accepted by the current H3 temporal rule (5 + 17*n), "
-        "without limiting the requested frame count."
-    )
+    DESCRIPTION = "Converts duration to the nearest H3-compatible frame count."
 
     def calculate(self, seconds, fps):
-        return calculate_h3_frames(seconds, fps)
+        _, h3_frames, _ = calculate_h3_frames(seconds, fps)
+        return (h3_frames,)
