@@ -771,11 +771,20 @@ class H3InferenceEngine:
             )
 
             block = self.transformer_blocks[block_index]
-            # Residual diagnostics are intentionally limited to selected
-            # checkpoints and are enabled by the existing tensor-stat toggle.
-            block.print_residual_diagnostics = (
-                self.print_tensor_stats and block_index in (0, 4, 9, 24, 49)
-            )
+            # Full per-block residual tracing is opt-in through the existing
+            # tensor-stat toggle. It identifies the first block where either
+            # modality's hidden stream starts growing.
+            block.print_residual_diagnostics = self.print_tensor_stats
+
+            if self.print_tensor_stats:
+                self._stats(
+                    f"Video hidden entering B{block_index + 1}",
+                    hidden[video_start:video_end],
+                )
+                self._stats(
+                    f"Audio hidden entering B{block_index + 1}",
+                    hidden[audio_start:audio_end],
+                )
 
             # Stage only the active block's small norm buffers on CUDA.
             # Projection matrices remain mmap-backed and are decoded by row
