@@ -437,7 +437,7 @@ def _print_tensor_summary(label, tensor):
         max_abs = torch.maximum(max_abs, value.abs().max())
         count += value.numel()
     print(
-        f"[H3 B2 internals] {label:<30} "
+        f"[H3 block internals] {label:<30} "
         f"rms={torch.sqrt(sum_sq / count).item():.5g} "
         f"mean_abs={(sum_abs / count).item():.5g} "
         f"max_abs={max_abs.item():.5g} "
@@ -784,8 +784,8 @@ class H3TransformerBlock(torch.nn.Module):
             self.norm1_weight,
         )
         if self.print_internal_diagnostics:
-            _print_tensor_summary("B2 norm1 RMSNorm", normalized)
-            _print_tensor_summary("B2 norm1 weight", self.norm1_weight)
+            _print_tensor_summary(f"B{self.block_index + 1} norm1 RMSNorm", normalized)
+            _print_tensor_summary(f"B{self.block_index + 1} norm1 weight", self.norm1_weight)
             token_tags = torch.remainder(adaln_indices, 3)
             for modality_name, modality_id in (("video", VIDEO), ("audio", AUDIO)):
                 matching = torch.nonzero(token_tags == modality_id, as_tuple=False)
@@ -794,7 +794,7 @@ class H3TransformerBlock(torch.nn.Module):
                 row = int(adaln_indices[matching[0, 0]].item())
                 for group in range(6):
                     _print_tensor_summary(
-                        f"B2 {modality_name} modulation g{group}",
+                        f"B{self.block_index + 1} {modality_name} modulation g{group}",
                         modulation_table[row, group],
                     )
 
@@ -807,7 +807,7 @@ class H3TransformerBlock(torch.nn.Module):
             token_tile=self.token_tile,
         )
         if self.print_internal_diagnostics:
-            _print_tensor_summary("B2 norm1 after AdaLN", normalized)
+            _print_tensor_summary(f"B{self.block_index + 1} norm1 after AdaLN", normalized)
 
         # ----------------------------------------------------
         # QKV PROJECTION
@@ -832,7 +832,7 @@ class H3TransformerBlock(torch.nn.Module):
             self.lora.add_qkv(normalized, qkv)
 
         if self.print_internal_diagnostics:
-            _print_tensor_summary("B2 QKV after LoRA", qkv)
+            _print_tensor_summary(f"B{self.block_index + 1} QKV after LoRA", qkv)
 
         qkv = qkv.reshape(
             token_count,
@@ -885,7 +885,7 @@ class H3TransformerBlock(torch.nn.Module):
             key_chunk=self.key_chunk,
         )
         if self.print_internal_diagnostics:
-            _print_tensor_summary("B2 attention result", attention)
+            _print_tensor_summary(f"B{self.block_index + 1} attention result", attention)
 
         del q, k, v, cos, sin
 
@@ -905,11 +905,11 @@ class H3TransformerBlock(torch.nn.Module):
             dtype=torch.float32,
         )
         if self.print_internal_diagnostics:
-            _print_tensor_summary("B2 out_proj before LoRA", attention_output)
+            _print_tensor_summary(f"B{self.block_index + 1} out_proj before LoRA", attention_output)
         if self.lora is not None:
             self.lora.add_linear("out_proj", attention, attention_output)
         if self.print_internal_diagnostics:
-            _print_tensor_summary("B2 out_proj after LoRA", attention_output)
+            _print_tensor_summary(f"B{self.block_index + 1} out_proj after LoRA", attention_output)
 
         del attention_cpu, attention
 
@@ -954,8 +954,8 @@ class H3TransformerBlock(torch.nn.Module):
             self.norm2_weight,
         )
         if self.print_internal_diagnostics:
-            _print_tensor_summary("B2 norm2 RMSNorm", normalized)
-            _print_tensor_summary("B2 norm2 weight", self.norm2_weight)
+            _print_tensor_summary(f"B{self.block_index + 1} norm2 RMSNorm", normalized)
+            _print_tensor_summary(f"B{self.block_index + 1} norm2 weight", self.norm2_weight)
 
         normalized = apply_adaln_indexed(
             normalized,
@@ -966,7 +966,7 @@ class H3TransformerBlock(torch.nn.Module):
             token_tile=self.token_tile,
         )
         if self.print_internal_diagnostics:
-            _print_tensor_summary("B2 norm2 after AdaLN", normalized)
+            _print_tensor_summary(f"B{self.block_index + 1} norm2 after AdaLN", normalized)
 
         # ----------------------------------------------------
         # MLP FC1
@@ -979,7 +979,7 @@ class H3TransformerBlock(torch.nn.Module):
             dtype=torch.float32,
         )
         if self.print_internal_diagnostics:
-            _print_tensor_summary("B2 FC1 before LoRA", fc1_output)
+            _print_tensor_summary(f"B{self.block_index + 1} FC1 before LoRA", fc1_output)
 
         del fc1_cpu
 
@@ -993,7 +993,7 @@ class H3TransformerBlock(torch.nn.Module):
         if self.lora is not None:
             self.lora.add_linear("fc1", normalized, fc1_output)
         if self.print_internal_diagnostics:
-            _print_tensor_summary("B2 FC1 after LoRA", fc1_output)
+            _print_tensor_summary(f"B{self.block_index + 1} FC1 after LoRA", fc1_output)
         del normalized
 
         # ----------------------------------------------------
@@ -1002,7 +1002,7 @@ class H3TransformerBlock(torch.nn.Module):
 
         mlp_hidden = swiglu(fc1_output)
         if self.print_internal_diagnostics:
-            _print_tensor_summary("B2 SwiGLU", mlp_hidden)
+            _print_tensor_summary(f"B{self.block_index + 1} SwiGLU", mlp_hidden)
 
         del fc1_output
 
@@ -1017,11 +1017,11 @@ class H3TransformerBlock(torch.nn.Module):
             dtype=torch.float32,
         )
         if self.print_internal_diagnostics:
-            _print_tensor_summary("B2 FC2 before LoRA", mlp_output)
+            _print_tensor_summary(f"B{self.block_index + 1} FC2 before LoRA", mlp_output)
         if self.lora is not None:
             self.lora.add_linear("fc2", mlp_hidden, mlp_output)
         if self.print_internal_diagnostics:
-            _print_tensor_summary("B2 FC2 after LoRA", mlp_output)
+            _print_tensor_summary(f"B{self.block_index + 1} FC2 after LoRA", mlp_output)
 
         del fc2_cpu, mlp_hidden
 
